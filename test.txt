@@ -1,0 +1,2 @@
+Hash Test file:
+~wow sha256 what a cool hashing function, i wish i was as cool as sha256 said sha1
