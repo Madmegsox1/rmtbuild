@@ -122,7 +122,7 @@ test "Get Hashes" {
         if (hash_) |hash| {
             var buff: [32]u8 = undefined;
             std.mem.writeInt(u256, &buff, hash, .little);
-            std.debug.print("{s} : {s}\n", .{ file.*, std.fmt.bytesToHex(buff, .lower) });
+            std.log.debug("{s} : {s}", .{ file.*, std.fmt.bytesToHex(buff, .lower) });
         }
     }
 }

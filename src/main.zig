@@ -26,3 +26,10 @@ pub fn main(init: std.process.Init) !void {
 
     try stdout_writer.flush(); // Don't forget to flush!
 }
+
+test {
+    _ = @import("file.zig");
+    _ = @import("rmt/pack.zig");
+    _ = @import("rmt/handler.zig");
+    _ = @import("rmt/serializer.zig");
+}

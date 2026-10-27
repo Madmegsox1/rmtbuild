@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const Packet = packed struct(u216) {
     token: u32,
-    transfer_len: u32 = 0,
+    transfer_len: u32 = @sizeOf(Packet),
     magic: u8,
     command: u8,
     command_size: u8 = 0,
