@@ -15,6 +15,17 @@ pub const RmtCommands = enum(u8) {
     RMT_LS = 0x20,
 };
 
+/// Files the server reported as changed. `files` slices into `payload`, free with `deinit`.
+pub const ChangedFiles = struct {
+    payload: Serializer.Bytes,
+    files: std.ArrayList([]const u8),
+
+    pub fn deinit(self: *ChangedFiles) void {
+        self.files.deinit(self.payload.allocator);
+        self.payload.deinit();
+    }
+};
+
 pub const RmtHandler = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -60,27 +71,55 @@ pub const RmtHandler = struct {
         try write_payload(self.io, payload, stream);
     }
 
+    /// Reads the server's reply and checks it answers `request`.
+    fn read_reply(request: Packet, r: *std.Io.Reader) !Packet {
+        const reply = try read_packet(r);
+
+        if (reply.token != request.token) return error.TokenMismatch;
+        if (reply.command != request.command) return error.CommandMismatch;
+
+        return reply;
+    }
+
     pub fn up(self: *Self) !void {
         const stream = try self.addr.connect(self.io, .{ .mode = .stream });
-        defer stream.close(std.testing.io);
+        defer stream.close(self.io);
 
         const packet = try self.init_packet(.RMT_UP);
 
         try pipe_packet(self, packet, stream);
+
+        var rbuff: [27]u8 = undefined;
+        var reader = stream.reader(self.io, &rbuff);
+        _ = try read_reply(packet, &reader.interface);
     }
 
-    pub fn ls(self: *Self, file_handler: *FileHandler) !void {
+    /// Returns the files whose hashes differ from the server's, free with `deinit`.
+    pub fn ls(self: *Self, file_handler: *FileHandler) !ChangedFiles {
         var serialized = try Serializer.string_map_to_bytes(u256, self.allocator, file_handler.hashed_files);
         defer serialized.deinit();
 
         const stream = try self.addr.connect(self.io, .{ .mode = .stream });
-        defer stream.close(std.testing.io);
+        defer stream.close(self.io);
 
         var packet = try self.init_packet(.RMT_LS);
         append_payload_len(&packet, serialized.bytes.len);
 
         try pipe_packet(self, packet, stream);
         try pipe_payload(self, serialized, stream);
+
+        var rbuff: [1024]u8 = undefined;
+        var reader = stream.reader(self.io, &rbuff);
+        const r = &reader.interface;
+
+        const reply = try read_reply(packet, r);
+        const payload = try read_payload(self.allocator, reply, r);
+        errdefer payload.deinit();
+
+        return .{
+            .payload = payload,
+            .files = try Serializer.bytes_to_string_list(self.allocator, payload.bytes),
+        };
     }
 };
 
@@ -117,19 +156,16 @@ pub const RmtServer = struct {
         var reader = stream.reader(self.io, &rbuff);
         const r = &reader.interface;
 
-        const packet: Packet = @bitCast(try r.takeInt(u216, .little));
-
-        if (packet.magic != 0xAF) return error.InvalidMagic;
-        if (packet.transfer_len < @sizeOf(Packet)) return error.InvalidTransferLen;
+        const packet = try read_packet(r);
 
         const command = std.enums.fromInt(RmtCommands, packet.command) orelse return error.UnknownCommand;
 
         switch (command) {
             .RMT_UP => try self.handle_up(packet, stream),
             .RMT_LS => {
-                const payload = try r.readAlloc(self.allocator, packet.transfer_len - @sizeOf(Packet));
-                defer self.allocator.free(payload);
-                try self.handle_ls(packet, payload, stream);
+                const payload = try read_payload(self.allocator, packet, r);
+                defer payload.deinit();
+                try self.handle_ls(packet, payload.bytes, stream);
             },
             .RMT_DOWN => return error.UnsupportedCommand,
         }
@@ -154,6 +190,8 @@ pub const RmtServer = struct {
         var changed: std.ArrayList([]const u8) = .empty;
         defer changed.deinit(self.allocator);
 
+        try self.file_handler.source_git_files();
+        try self.file_handler.hash_files();
         const server_hashes = self.file_handler.get_hashes();
 
         var it = client_hashes.iterator();
@@ -193,6 +231,19 @@ fn write_payload(io: std.Io, payload: Serializer.Bytes, stream: net.Stream) !voi
     try w.flush();
 }
 
+fn read_packet(r: *std.Io.Reader) !Packet {
+    const packet: Packet = @bitCast(try r.takeInt(u216, .little));
+
+    if (packet.magic != 0xAF) return error.InvalidMagic;
+    if (packet.transfer_len < @sizeOf(Packet)) return error.InvalidTransferLen;
+
+    return packet;
+}
+
+fn read_payload(alloc: std.mem.Allocator, packet: Packet, r: *std.Io.Reader) !Serializer.Bytes {
+    return .init(alloc, try r.readAlloc(alloc, packet.transfer_len - @sizeOf(Packet)));
+}
+
 fn runRmt(rmt: *RmtHandler, err_out: *?anyerror) void {
     rmt.up() catch |err| {
         err_out.* = err;
@@ -221,7 +272,9 @@ test "UP Command" {
     var rbuff: [27]u8 = undefined;
 
     var reader = stream.reader(std.testing.io, &rbuff);
-    const packet: Packet = @bitCast(try reader.interface.takeInt(u216, .little));
+    const packet = try read_packet(&reader.interface);
+
+    try write_packet(std.testing.io, RmtServer.reply_packet(packet), stream);
 
     thread.join();
 
@@ -231,9 +284,10 @@ test "UP Command" {
     try std.testing.expect(packet.command == @intFromEnum(RmtCommands.RMT_UP));
 }
 
-fn runRmtLs(rmt: *RmtHandler, file: *FileHandler, err_out: *?anyerror) void {
-    rmt.ls(file) catch |err| {
+fn runRmtLs(rmt: *RmtHandler, file: *FileHandler, out: *?ChangedFiles, err_out: *?anyerror) void {
+    out.* = rmt.ls(file) catch |err| {
         err_out.* = err;
+        return;
     };
 }
 
@@ -257,7 +311,9 @@ test "LS Command" {
     try file.source_git_files();
     try file.hash_files();
 
-    const thread = try std.Thread.spawn(.{}, runRmtLs, .{ &rmt, &file, &rmt_err });
+    var changed: ?ChangedFiles = null;
+
+    const thread = try std.Thread.spawn(.{}, runRmtLs, .{ &rmt, &file, &changed, &rmt_err });
 
     var stream = try listen.accept(std.testing.io);
     defer stream.close(std.testing.io);
@@ -266,18 +322,25 @@ test "LS Command" {
 
     var reader = stream.reader(std.testing.io, &rbuff);
 
-    const packet: Packet = @bitCast(try reader.interface.takeInt(u216, .little));
+    const packet = try read_packet(&reader.interface);
 
-    const payload_sz = packet.transfer_len - @sizeOf(Packet);
+    const payload = try read_payload(alloc, packet, &reader.interface);
 
-    const payload = try reader.interface.readAlloc(alloc, payload_sz);
-
-    var map = try Serializer.bytes_to_string_map(u256, std.testing.allocator, payload);
+    var map = try Serializer.bytes_to_string_map(u256, std.testing.allocator, payload.bytes);
     defer map.deinit();
+
+    const reply_files = try Serializer.string_list_to_bytes(alloc, &.{"build.zig"});
+    var reply = RmtServer.reply_packet(packet);
+    RmtHandler.append_payload_len(&reply, reply_files.bytes.len);
+    try write_packet(std.testing.io, reply, stream);
+    try write_payload(std.testing.io, reply_files, stream);
 
     thread.join();
 
     if (rmt_err) |e| return e;
+
+    try std.testing.expect(changed.?.files.items.len == 1);
+    try std.testing.expectEqualStrings("build.zig", changed.?.files.items[0]);
 
     try std.testing.expect(packet.magic == 0xAF);
     try std.testing.expect(packet.command == @intFromEnum(RmtCommands.RMT_LS));
@@ -320,7 +383,7 @@ test "Server UP Command" {
 
     var rbuff: [27]u8 = undefined;
     var reader = stream.reader(std.testing.io, &rbuff);
-    const reply: Packet = @bitCast(try reader.interface.takeInt(u216, .little));
+    const reply = try read_packet(&reader.interface);
 
     thread.join();
 
@@ -370,8 +433,8 @@ test "Server LS Command" {
 
     var rbuff: [256]u8 = undefined;
     var reader = stream.reader(std.testing.io, &rbuff);
-    const reply: Packet = @bitCast(try reader.interface.takeInt(u216, .little));
-    const payload = try reader.interface.readAlloc(alloc, reply.transfer_len - @sizeOf(Packet));
+    const reply = try read_packet(&reader.interface);
+    const payload = try read_payload(alloc, reply, &reader.interface);
 
     thread.join();
 
@@ -381,7 +444,7 @@ test "Server LS Command" {
     try std.testing.expect(reply.token == 7);
     try std.testing.expect(reply.command == @intFromEnum(RmtCommands.RMT_LS));
 
-    const changed = try Serializer.bytes_to_string_list(alloc, payload);
+    const changed = try Serializer.bytes_to_string_list(alloc, payload.bytes);
 
     try std.testing.expect(changed.items.len == 2);
     for (changed.items) |name| {
