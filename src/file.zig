@@ -79,6 +79,21 @@ pub const FileHandler = struct {
         }
     }
 
+    pub fn replace_file(self: *Self, hash: u256, data: []const u8) !u256 {
+        var it = self.hashed_files.iterator();
+        const entry = find: while (it.next()) |entry| {
+            if (entry.value_ptr.* == hash) break :find entry;
+        } else return error.HashNotFound;
+
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = entry.key_ptr.*, .data = data });
+
+        var new_hash: [32]u8 = undefined;
+        Sha256.hash(data, &new_hash, .{});
+        entry.value_ptr.* = std.mem.readInt(u256, &new_hash, .little);
+
+        return entry.value_ptr.*;
+    }
+
     pub fn get(self: *const Self) []const []const u8 {
         return self.files.items;
     }
@@ -125,4 +140,30 @@ test "Get Hashes" {
             std.log.debug("{s} : {s}", .{ file.*, std.fmt.bytesToHex(buff, .lower) });
         }
     }
+}
+
+test "Replace File" {
+    var handler: FileHandler = FileHandler.init(std.testing.allocator, std.testing.io);
+    defer handler.deinit();
+
+    const path = ".zig-cache/replace_test.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "old" });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var old_hash: [32]u8 = undefined;
+    Sha256.hash("old", &old_hash, .{});
+    try handler.hashed_files.put(path, std.mem.readInt(u256, &old_hash, .little));
+
+    const new_hash = try handler.replace_file(std.mem.readInt(u256, &old_hash, .little), "new");
+
+    var expected: [32]u8 = undefined;
+    Sha256.hash("new", &expected, .{});
+    try std.testing.expect(new_hash == std.mem.readInt(u256, &expected, .little));
+    try std.testing.expect(handler.get_hashes().get(path).? == new_hash);
+
+    var buff: [16]u8 = undefined;
+    const contents = try std.Io.Dir.cwd().readFile(std.testing.io, path, &buff);
+    try std.testing.expectEqualStrings("new", contents);
+
+    try std.testing.expectError(error.HashNotFound, handler.replace_file(0, "x"));
 }

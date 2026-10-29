@@ -3,6 +3,7 @@ const net = @import("std").Io.net;
 const Packet = @import("pack.zig").Packet;
 const FileHandler = @import("../file.zig").FileHandler;
 const Serializer = @import("serializer.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const RmtInfo = struct {
     address: []const u8,
@@ -13,6 +14,8 @@ pub const RmtCommands = enum(u8) {
     RMT_UP = 0x10,
     RMT_DOWN = 0x11,
     RMT_LS = 0x20,
+    RMT_FR = 0x21,
+    RMT_FN = 0x22,
 };
 
 /// Files the server reported as changed. `files` slices into `payload`, free with `deinit`.
@@ -89,12 +92,30 @@ pub const RmtHandler = struct {
 
         try pipe_packet(self, packet, stream);
 
-        var rbuff: [27]u8 = undefined;
+        var rbuff: [Packet.wire_size]u8 = undefined;
         var reader = stream.reader(self.io, &rbuff);
         _ = try read_reply(packet, &reader.interface);
     }
 
-    /// Returns the files whose hashes differ from the server's, free with `deinit`.
+    pub fn fr(self: *Self, file: []const u8, remote_hash: u256, local_hash: u256) !void {
+        var packet = try self.init_packet(.RMT_FR);
+        packet.args.hash = remote_hash;
+        append_payload_len(&packet, file.len);
+
+        const stream = try self.addr.connect(self.io, .{ .mode = .stream });
+        defer stream.close(self.io);
+
+        try pipe_packet(self, packet, stream);
+        try pipe_payload(self, file, stream);
+
+        var rbuff: [Packet.wire_size]u8 = undefined;
+        var reader = stream.reader(self.io, &rbuff);
+        const reply = try read_reply(packet, &reader.interface);
+        if (reply.args.hash != local_hash) {
+            return error.MismatchedHash;
+        }
+    }
+
     pub fn ls(self: *Self, file_handler: *FileHandler) !ChangedFiles {
         var serialized = try Serializer.string_map_to_bytes(u256, self.allocator, file_handler.hashed_files);
         defer serialized.deinit();
@@ -167,6 +188,12 @@ pub const RmtServer = struct {
                 defer payload.deinit();
                 try self.handle_ls(packet, payload.bytes, stream);
             },
+            .RMT_FR => {
+                const payload = try read_payload(self.allocator, packet, r);
+                defer payload.deinit();
+                try self.handle_fr(packet, payload.bytes, stream);
+            },
+            .RMT_FN => return error.UnsupportedCommand,
             .RMT_DOWN => return error.UnsupportedCommand,
         }
     }
@@ -181,6 +208,17 @@ pub const RmtServer = struct {
 
     fn handle_up(self: *Self, request: Packet, stream: net.Stream) !void {
         try write_packet(self.io, reply_packet(request), stream);
+    }
+
+    fn handle_fr(self: *Self, request: Packet, payload: []const u8, stream: net.Stream) !void {
+        var hash: [32]u8 = undefined;
+
+        Sha256.hash(payload, &hash, .{});
+        const hash_i = std.mem.readInt(u256, &hash, .little);
+
+        var packet = reply_packet(request);
+        packet.args.hash = hash_i;
+        try write_packet(self.io, packet, stream);
     }
 
     fn handle_ls(self: *Self, request: Packet, payload: []const u8, stream: net.Stream) !void {
@@ -214,9 +252,9 @@ pub const RmtServer = struct {
 };
 
 fn write_packet(io: std.Io, packet: Packet, stream: net.Stream) !void {
-    var bytes: [27]u8 = undefined;
-    var wbuff: [27]u8 = undefined;
-    std.mem.writeInt(u216, &bytes, @bitCast(packet), .little);
+    var bytes: [Packet.wire_size]u8 = undefined;
+    var wbuff: [Packet.wire_size]u8 = undefined;
+    std.mem.writeInt(Packet.Int, &bytes, @bitCast(packet), .little);
     var writer = stream.writer(io, &wbuff);
     const w = &writer.interface;
     try w.writeAll(&bytes);
@@ -232,16 +270,16 @@ fn write_payload(io: std.Io, payload: Serializer.Bytes, stream: net.Stream) !voi
 }
 
 fn read_packet(r: *std.Io.Reader) !Packet {
-    const packet: Packet = @bitCast(try r.takeInt(u216, .little));
+    const packet: Packet = @bitCast(try r.takeInt(Packet.Int, .little));
 
     if (packet.magic != 0xAF) return error.InvalidMagic;
-    if (packet.transfer_len < @sizeOf(Packet)) return error.InvalidTransferLen;
+    if (packet.transfer_len < Packet.wire_size) return error.InvalidTransferLen;
 
     return packet;
 }
 
 fn read_payload(alloc: std.mem.Allocator, packet: Packet, r: *std.Io.Reader) !Serializer.Bytes {
-    return .init(alloc, try r.readAlloc(alloc, packet.transfer_len - @sizeOf(Packet)));
+    return .init(alloc, try r.readAlloc(alloc, packet.transfer_len - Packet.wire_size));
 }
 
 fn runRmt(rmt: *RmtHandler, err_out: *?anyerror) void {
@@ -269,7 +307,7 @@ test "UP Command" {
     var stream = try listen.accept(std.testing.io);
     defer stream.close(std.testing.io);
 
-    var rbuff: [27]u8 = undefined;
+    var rbuff: [Packet.wire_size]u8 = undefined;
 
     var reader = stream.reader(std.testing.io, &rbuff);
     const packet = try read_packet(&reader.interface);
@@ -318,7 +356,7 @@ test "LS Command" {
     var stream = try listen.accept(std.testing.io);
     defer stream.close(std.testing.io);
 
-    var rbuff: [27]u8 = undefined;
+    var rbuff: [Packet.wire_size]u8 = undefined;
 
     var reader = stream.reader(std.testing.io, &rbuff);
 
@@ -381,7 +419,7 @@ test "Server UP Command" {
 
     try write_packet(std.testing.io, .{ .magic = 0xAF, .token = 42, .command = @intFromEnum(RmtCommands.RMT_UP) }, stream);
 
-    var rbuff: [27]u8 = undefined;
+    var rbuff: [Packet.wire_size]u8 = undefined;
     var reader = stream.reader(std.testing.io, &rbuff);
     const reply = try read_packet(&reader.interface);
 
