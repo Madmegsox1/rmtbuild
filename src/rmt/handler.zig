@@ -116,6 +116,13 @@ pub const RmtHandler = struct {
         }
     }
 
+    pub fn fnp(self: *Self, file: []const u8, file_name: []const u8, remote_hash: u256) void {
+        _ = self;
+        _ = file;
+        _ = file_name;
+        _ = remote_hash;
+    }
+
     pub fn ls(self: *Self, file_handler: *FileHandler) !ChangedFiles {
         var serialized = try Serializer.string_map_to_bytes(u256, self.allocator, file_handler.hashed_files);
         defer serialized.deinit();
@@ -216,6 +223,12 @@ pub const RmtServer = struct {
         Sha256.hash(payload, &hash, .{});
         const hash_i = std.mem.readInt(u256, &hash, .little);
 
+        const new_hash = try self.file_handler.replace_file(request.args.hash, payload);
+
+        if (new_hash != hash_i) {
+            return error.HashMismatch;
+        }
+
         var packet = reply_packet(request);
         packet.args.hash = hash_i;
         try write_packet(self.io, packet, stream);
@@ -295,7 +308,7 @@ test "UP Command" {
     const alloc = arena.allocator();
 
     const addr = try net.IpAddress.parse("0.0.0.0", 8099);
-    var listen = try addr.listen(std.testing.io, .{ .kernel_backlog = 64, .mode = .stream, .protocol = .tcp });
+    var listen = try addr.listen(std.testing.io, .{ .kernel_backlog = 64, .mode = .stream, .protocol = .tcp, .reuse_address = true });
     defer listen.deinit(std.testing.io);
 
     var rmt: RmtHandler = try RmtHandler.init(alloc, std.testing.io, .{ .address = "0.0.0.0", .port = 8099 });
@@ -336,7 +349,7 @@ test "LS Command" {
     const alloc = arena.allocator();
 
     const addr = try net.IpAddress.parse("0.0.0.0", 8099);
-    var listen = try addr.listen(std.testing.io, .{ .kernel_backlog = 64, .mode = .stream, .protocol = .tcp });
+    var listen = try addr.listen(std.testing.io, .{ .kernel_backlog = 64, .mode = .stream, .protocol = .tcp, .reuse_address = true });
     defer listen.deinit(std.testing.io);
 
     var rmt: RmtHandler = try RmtHandler.init(alloc, std.testing.io, .{ .address = "0.0.0.0", .port = 8099 });
