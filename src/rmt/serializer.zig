@@ -96,6 +96,59 @@ pub fn bytes_to_string_list(allocator: std.mem.Allocator, bytes: []const u8) !st
     return list;
 }
 
+/// RMT_FN payload layout: `[u32 name_len][name][data]`.
+/// Only the name is length prefixed, `data` runs to the end of the payload. The payload's
+/// total length is already known from the packet's `transfer_len`, so the data length is
+/// whatever is left after the name.
+pub const FilePayload = struct {
+    name: []const u8,
+    data: []const u8,
+};
+
+pub fn file_payload_to_bytes(allocator: std.mem.Allocator, name: []const u8, data: []const u8) !Bytes {
+    const name_len = std.math.cast(u32, name.len) orelse return error.NameTooLong;
+
+    const buf = try allocator.alloc(u8, 4 + name.len + data.len);
+    std.mem.writeInt(u32, buf[0..4], name_len, .little);
+    @memcpy(buf[4..][0..name.len], name);
+    @memcpy(buf[4 + name.len ..], data);
+
+    return .init(allocator, buf);
+}
+
+/// Returned slices point into `bytes`.
+pub fn bytes_to_file_payload(bytes: []const u8) !FilePayload {
+    if (bytes.len < 4) return error.Trucated;
+
+    const len = std.mem.readInt(u32, bytes[0..4], .little);
+    if (bytes.len - 4 < len) return error.Trucated;
+
+    return .{
+        .name = bytes[4..][0..len],
+        .data = bytes[4 + len ..],
+    };
+}
+
+test "File Payload Serialization" {
+    const bytes = try file_payload_to_bytes(std.testing.allocator, "src/new.zig", "const x = 1;\n");
+    defer bytes.deinit();
+
+    const payload = try bytes_to_file_payload(bytes.bytes);
+    try std.testing.expectEqualStrings("src/new.zig", payload.name);
+    try std.testing.expectEqualStrings("const x = 1;\n", payload.data);
+
+    // Empty files are valid, the payload is just the name.
+    const empty = try file_payload_to_bytes(std.testing.allocator, "empty.txt", "");
+    defer empty.deinit();
+    const empty_payload = try bytes_to_file_payload(empty.bytes);
+    try std.testing.expectEqualStrings("empty.txt", empty_payload.name);
+    try std.testing.expect(empty_payload.data.len == 0);
+
+    // Name length claims more bytes than were sent.
+    try std.testing.expectError(error.Trucated, bytes_to_file_payload(bytes.bytes[0..6]));
+    try std.testing.expectError(error.Trucated, bytes_to_file_payload(bytes.bytes[0..2]));
+}
+
 test "List Serialization" {
     const strs: []const []const u8 = &.{ "a.txt", "", "src/b.zig" };
 

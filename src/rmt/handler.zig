@@ -1,13 +1,20 @@
 const std = @import("std");
 const net = @import("std").Io.net;
 const Packet = @import("pack.zig").Packet;
+const RunKind = @import("pack.zig").RunKind;
 const FileHandler = @import("../file.zig").FileHandler;
+const config = @import("../config.zig");
 const Serializer = @import("serializer.zig");
+const wire = @import("wire.zig");
+const auth = @import("auth.zig");
+const forward = @import("forward.zig");
+const process = @import("../process.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const RmtInfo = struct {
     address: []const u8,
     port: u16,
+    key: auth.Key,
 };
 
 pub const RmtCommands = enum(u8) {
@@ -16,16 +23,69 @@ pub const RmtCommands = enum(u8) {
     RMT_LS = 0x20,
     RMT_FR = 0x21,
     RMT_FN = 0x22,
+    RMT_FD = 0x23,
+    RMT_RUN = 0x30,
+    RMT_FWD = 0x31,
 };
 
-/// Files the server reported as changed. `files` slices into `payload`, free with `deinit`.
-pub const ChangedFiles = struct {
-    payload: Serializer.Bytes,
-    files: std.ArrayList([]const u8),
+pub const SyncStats = struct {
+    created: usize = 0,
+    replaced: usize = 0,
+    deleted: usize = 0,
+};
 
-    pub fn deinit(self: *ChangedFiles) void {
-        self.files.deinit(self.payload.allocator);
+pub const RunResult = union(enum) {
+    exited: u32,
+    signal: u32,
+    /// The server couldn't run the command. Message is owned by the handler's allocator.
+    failed: []u8,
+};
+
+pub const LsResult = struct {
+    payload: Serializer.Bytes,
+    missing: std.ArrayList([]const u8),
+    changed: std.StringHashMap(u256),
+    extra: std.StringHashMap(u256),
+
+    pub fn deinit(self: *LsResult) void {
+        self.missing.deinit(self.payload.allocator);
+        self.changed.deinit();
+        self.extra.deinit();
         self.payload.deinit();
+    }
+
+    /// Wire format: a string list of three sections, `[missing list][changed map][extra map]`.
+    pub fn encode(
+        alloc: std.mem.Allocator,
+        missing: []const []const u8,
+        changed: std.StringHashMap(u256),
+        extra: std.StringHashMap(u256),
+    ) !Serializer.Bytes {
+        const missing_bytes = try Serializer.string_list_to_bytes(alloc, missing);
+        defer missing_bytes.deinit();
+        const changed_bytes = try Serializer.string_map_to_bytes(u256, alloc, changed);
+        defer changed_bytes.deinit();
+        const extra_bytes = try Serializer.string_map_to_bytes(u256, alloc, extra);
+        defer extra_bytes.deinit();
+
+        return Serializer.string_list_to_bytes(alloc, &.{ missing_bytes.bytes, changed_bytes.bytes, extra_bytes.bytes });
+    }
+
+    /// Takes ownership of `payload` on success.
+    pub fn decode(payload: Serializer.Bytes) !LsResult {
+        const alloc = payload.allocator;
+
+        var sections = try Serializer.bytes_to_string_list(alloc, payload.bytes);
+        defer sections.deinit(alloc);
+        if (sections.items.len != 3) return error.InvalidReply;
+
+        var missing = try Serializer.bytes_to_string_list(alloc, sections.items[0]);
+        errdefer missing.deinit(alloc);
+        var changed = try Serializer.bytes_to_string_map(u256, alloc, sections.items[1]);
+        errdefer changed.deinit();
+        const extra = try Serializer.bytes_to_string_map(u256, alloc, sections.items[2]);
+
+        return .{ .payload = payload, .missing = missing, .changed = changed, .extra = extra };
     }
 };
 
@@ -34,7 +94,8 @@ pub const RmtHandler = struct {
     io: std.Io,
     info: RmtInfo,
     addr: net.IpAddress,
-    token_c: u32 = 0,
+    /// Atomic, forwarded connections make requests from their own threads.
+    token_c: std.atomic.Value(u32) = .init(0),
 
     const Self = @This();
 
@@ -50,33 +111,34 @@ pub const RmtHandler = struct {
     }
 
     fn init_packet(self: *Self, command: RmtCommands) !Packet {
-        if (self.token_c > std.math.maxInt(u32) - 1) {
-            return error.PacketCOverflow;
-        }
-        self.token_c += 1;
+        const token = self.token_c.fetchAdd(1, .monotonic) +% 1;
+        if (token == 0) return error.PacketCOverflow;
 
         return .{
-            .magic = 0xAF,
-            .token = self.token_c,
+            .magic = wire.magic,
+            .token = token,
             .command = @intFromEnum(command),
         };
     }
 
-    fn append_payload_len(packet: *Packet, payload_len: usize) void {
-        packet.transfer_len += @intCast(payload_len);
+    fn connect(self: *Self) !net.Stream {
+        const stream = try self.addr.connect(self.io, .{ .mode = .stream });
+        errdefer stream.close(self.io);
+        try auth.client_handshake(self.io, &self.info.key, stream);
+        return stream;
     }
 
     fn pipe_packet(self: *Self, packet: Packet, stream: net.Stream) !void {
-        try write_packet(self.io, packet, stream);
+        try wire.write_packet(self.io, packet, stream);
     }
 
-    fn pipe_payload(self: *Self, payload: Serializer.Bytes, stream: net.Stream) !void {
-        try write_payload(self.io, payload, stream);
+    fn pipe_payload(self: *Self, payload: []const u8, stream: net.Stream) !void {
+        try wire.write_payload(self.io, payload, stream);
     }
 
     /// Reads the server's reply and checks it answers `request`.
     fn read_reply(request: Packet, r: *std.Io.Reader) !Packet {
-        const reply = try read_packet(r);
+        const reply = try wire.read_packet(r);
 
         if (reply.token != request.token) return error.TokenMismatch;
         if (reply.command != request.command) return error.CommandMismatch;
@@ -85,7 +147,7 @@ pub const RmtHandler = struct {
     }
 
     pub fn up(self: *Self) !void {
-        const stream = try self.addr.connect(self.io, .{ .mode = .stream });
+        const stream = try self.connect();
         defer stream.close(self.io);
 
         const packet = try self.init_packet(.RMT_UP);
@@ -97,16 +159,19 @@ pub const RmtHandler = struct {
         _ = try read_reply(packet, &reader.interface);
     }
 
-    pub fn fr(self: *Self, file: []const u8, remote_hash: u256, local_hash: u256) !void {
+    pub fn fr(self: *Self, file: []const u8, file_name: []const u8, remote_hash: u256, local_hash: u256) !void {
+        var payload = try Serializer.file_payload_to_bytes(self.allocator, file_name, file);
+        defer payload.deinit();
+
         var packet = try self.init_packet(.RMT_FR);
         packet.args.hash = remote_hash;
-        append_payload_len(&packet, file.len);
+        try wire.append_payload_len(&packet, payload.bytes.len);
 
-        const stream = try self.addr.connect(self.io, .{ .mode = .stream });
+        const stream = try self.connect();
         defer stream.close(self.io);
 
         try pipe_packet(self, packet, stream);
-        try pipe_payload(self, file, stream);
+        try pipe_payload(self, payload.bytes, stream);
 
         var rbuff: [Packet.wire_size]u8 = undefined;
         var reader = stream.reader(self.io, &rbuff);
@@ -116,38 +181,230 @@ pub const RmtHandler = struct {
         }
     }
 
-    pub fn fnp(self: *Self, file: []const u8, file_name: []const u8, remote_hash: u256) void {
-        _ = self;
-        _ = file;
-        _ = file_name;
-        _ = remote_hash;
+    pub fn fnp(self: *Self, file: []const u8, file_name: []const u8, expected_hash: u256) !void {
+        var payload = try Serializer.file_payload_to_bytes(self.allocator, file_name, file);
+        defer payload.deinit();
+
+        var packet = try self.init_packet(.RMT_FN);
+        packet.args.hash = expected_hash;
+        try wire.append_payload_len(&packet, payload.bytes.len);
+
+        const stream = try self.connect();
+        defer stream.close(self.io);
+
+        try pipe_packet(self, packet, stream);
+        try pipe_payload(self, payload.bytes, stream);
+
+        var rbuff: [Packet.wire_size]u8 = undefined;
+        var reader = stream.reader(self.io, &rbuff);
+        const reply = try read_reply(packet, &reader.interface);
+        if (reply.args.hash != expected_hash) {
+            return error.MismatchedHash;
+        }
     }
 
-    pub fn ls(self: *Self, file_handler: *FileHandler) !ChangedFiles {
+    pub fn fd(self: *Self, file_name: []const u8, remote_hash: u256) !void {
+        var packet = try self.init_packet(.RMT_FD);
+        packet.args.hash = remote_hash;
+        try wire.append_payload_len(&packet, file_name.len);
+
+        const stream = try self.connect();
+        defer stream.close(self.io);
+
+        try pipe_packet(self, packet, stream);
+        try pipe_payload(self, file_name, stream);
+
+        var rbuff: [Packet.wire_size]u8 = undefined;
+        var reader = stream.reader(self.io, &rbuff);
+        _ = try read_reply(packet, &reader.interface);
+    }
+
+    pub fn ls(self: *Self, file_handler: *FileHandler) !LsResult {
         var serialized = try Serializer.string_map_to_bytes(u256, self.allocator, file_handler.hashed_files);
         defer serialized.deinit();
 
-        const stream = try self.addr.connect(self.io, .{ .mode = .stream });
+        const stream = try self.connect();
         defer stream.close(self.io);
 
         var packet = try self.init_packet(.RMT_LS);
-        append_payload_len(&packet, serialized.bytes.len);
+        try wire.append_payload_len(&packet, serialized.bytes.len);
 
         try pipe_packet(self, packet, stream);
-        try pipe_payload(self, serialized, stream);
+        try pipe_payload(self, serialized.bytes, stream);
 
         var rbuff: [1024]u8 = undefined;
         var reader = stream.reader(self.io, &rbuff);
         const r = &reader.interface;
 
         const reply = try read_reply(packet, r);
-        const payload = try read_payload(self.allocator, reply, r);
+        const payload = try wire.read_payload(self.allocator, reply, r);
         errdefer payload.deinit();
 
-        return .{
-            .payload = payload,
-            .files = try Serializer.bytes_to_string_list(self.allocator, payload.bytes),
+        return LsResult.decode(payload);
+    }
+
+    /// Makes the server's files match `file_handler`, which should already be hashed.
+    pub fn sync(self: *Self, file_handler: *FileHandler) !SyncStats {
+        var diff = try self.ls(file_handler);
+        defer diff.deinit();
+
+        var stats: SyncStats = .{};
+
+        for (diff.missing.items) |name| {
+            const data = try file_handler.read_file(self.allocator, name);
+            defer self.allocator.free(data);
+            try self.fnp(data, name, file_handler.get_hashes().get(name).?);
+            stats.created += 1;
+        }
+
+        var changed = diff.changed.iterator();
+        while (changed.next()) |entry| {
+            const name = entry.key_ptr.*;
+            const data = try file_handler.read_file(self.allocator, name);
+            defer self.allocator.free(data);
+            try self.fr(data, name, entry.value_ptr.*, file_handler.get_hashes().get(name).?);
+            stats.replaced += 1;
+        }
+
+        var extra = diff.extra.iterator();
+        while (extra.next()) |entry| {
+            try self.fd(entry.key_ptr.*, entry.value_ptr.*);
+            stats.deleted += 1;
+        }
+
+        return stats;
+    }
+
+    /// Runs the configured command `name` on the server, writing its output to `out` as it arrives.
+    pub fn run(self: *Self, name: []const u8, out: *std.Io.Writer) !RunResult {
+        var packet = try self.init_packet(.RMT_RUN);
+        try wire.append_payload_len(&packet, name.len);
+
+        const stream = try self.connect();
+        defer stream.close(self.io);
+
+        try pipe_packet(self, packet, stream);
+        try pipe_payload(self, name, stream);
+
+        var rbuff: [4096]u8 = undefined;
+        var reader = stream.reader(self.io, &rbuff);
+        const r = &reader.interface;
+
+        while (true) {
+            const reply = try read_reply(packet, r);
+            const payload = try wire.read_payload(self.allocator, reply, r);
+            errdefer payload.deinit();
+
+            switch (reply.args.run.kind) {
+                .output => {
+                    defer payload.deinit();
+                    try out.writeAll(payload.bytes);
+                    try out.flush();
+                },
+                .exit => {
+                    payload.deinit();
+                    return .{ .exited = reply.args.run.code };
+                },
+                .signal => {
+                    payload.deinit();
+                    return .{ .signal = reply.args.run.code };
+                },
+                .failed => return .{ .failed = payload.bytes },
+                _ => return error.InvalidReply,
+            }
+        }
+    }
+
+    /// Opens a connection to `port` on the server's localhost. Afterwards the stream carries
+    /// raw bytes. `error.ForwardRefused` if nothing is listening there.
+    pub fn open_forward(self: *Self, port: u16) !net.Stream {
+        const stream = try self.connect();
+        errdefer stream.close(self.io);
+
+        var packet = try self.init_packet(.RMT_FWD);
+        packet.args = .{ .forward = .{ .port = port } };
+        try pipe_packet(self, packet, stream);
+
+        // Exactly one header, so the target's first bytes (if it talks first) aren't buffered here.
+        var rbuff: [Packet.wire_size]u8 = undefined;
+        var reader = stream.reader(self.io, &rbuff);
+        const reply = try read_reply(packet, &reader.interface);
+        if (!reply.args.forward.ok) return error.ForwardRefused;
+
+        return stream;
+    }
+
+    /// Listens on 127.0.0.1:`fwd.local` and tunnels each connection to the server's
+    /// localhost:`fwd.remote`. Runs until `Forwarder.stop`.
+    pub fn forward(self: *Self, fwd: config.Forward) !*Forwarder {
+        const addr = try net.IpAddress.parse("127.0.0.1", fwd.local);
+        var listener = try addr.listen(self.io, .{ .mode = .stream, .protocol = .tcp, .reuse_address = true });
+        errdefer listener.deinit(self.io);
+
+        const forwarder = try self.allocator.create(Forwarder);
+        errdefer self.allocator.destroy(forwarder);
+        forwarder.* = .{ .rmt = self, .listener = listener, .fwd = fwd, .thread = undefined };
+        forwarder.thread = try std.Thread.spawn(.{}, Forwarder.accept_loop, .{forwarder});
+
+        return forwarder;
+    }
+};
+
+pub const Forwarder = struct {
+    rmt: *RmtHandler,
+    listener: net.Server,
+    fwd: config.Forward,
+    thread: std.Thread,
+    stopping: std.atomic.Value(bool) = .init(false),
+
+    /// Stops accepting, connections already being forwarded carry on until they close.
+    pub fn stop(self: *Forwarder) void {
+        const io = self.rmt.io;
+        self.stopping.store(true, .release);
+        // accept() can't be interrupted portably, so wake it with a connection of our own.
+        if (net.IpAddress.parse("127.0.0.1", self.fwd.local)) |addr| {
+            if (addr.connect(io, .{ .mode = .stream })) |s| s.close(io) else |_| {}
+        } else |_| {}
+        self.thread.join();
+        self.listener.deinit(io);
+        self.rmt.allocator.destroy(self);
+    }
+
+    fn accept_loop(self: *Forwarder) void {
+        const io = self.rmt.io;
+        while (true) {
+            const local = self.listener.accept(io) catch |err| {
+                std.log.err("forward localhost:{d}: {s}", .{ self.fwd.local, @errorName(err) });
+                return;
+            };
+            if (self.stopping.load(.acquire)) {
+                local.close(io);
+                return;
+            }
+            const thread = std.Thread.spawn(.{}, connection, .{ self.rmt, local, self.fwd }) catch {
+                local.close(io);
+                continue;
+            };
+            thread.detach();
+        }
+    }
+
+    fn connection(rmt: *RmtHandler, local: net.Stream, fwd: config.Forward) void {
+        const io = rmt.io;
+        defer local.close(io);
+
+        const remote = rmt.open_forward(fwd.remote) catch |err| {
+            switch (err) {
+                error.ForwardRefused => std.log.warn("forward localhost:{d}: nothing is listening on the server's port {d} yet", .{ fwd.local, fwd.remote }),
+                else => std.log.warn("forward localhost:{d}: {s}", .{ fwd.local, @errorName(err) }),
+            }
+            return;
         };
+        defer remote.close(io);
+
+        var buf: [16 * 1024]u8 = undefined;
+        var reader = local.reader(io, &buf);
+        forward.pipe(io, local, &reader.interface, remote);
     }
 };
 
@@ -155,350 +412,329 @@ pub const RmtServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     file_handler: *FileHandler,
+    key: auth.Key,
+    /// Requests with a bigger payload are dropped before anything is allocated.
+    max_payload: u32 = default_max_payload,
+    /// Connections run on their own threads, file changes and config reads go one at a time.
+    files_lock: std.Io.Mutex = .init,
+
+    pub const default_max_payload = 256 * 1024 * 1024;
 
     const Self = @This();
 
     /// `file_handler` should already be hashed, it is the server side view of the files.
-    pub fn init(alloc: std.mem.Allocator, io: std.Io, file_handler: *FileHandler) Self {
+    pub fn init(alloc: std.mem.Allocator, io: std.Io, file_handler: *FileHandler, key: auth.Key) Self {
         return .{
             .allocator = alloc,
             .io = io,
             .file_handler = file_handler,
+            .key = key,
         };
     }
 
-    /// Accepts connections forever, handling one packet per connection.
+    /// Accepts connections forever, each on its own thread so a long running command doesn't
+    /// block syncs or forwarded connections. One packet per connection.
     pub fn serve(self: *Self, listener: *net.Server) !void {
         while (true) {
             const stream = try listener.accept(self.io);
-            defer stream.close(self.io);
-
-            self.handle(stream) catch |err| {
-                std.log.err("rmt: failed to handle packet: {any}", .{err});
+            const thread = std.Thread.spawn(.{}, handle_connection, .{ self, stream }) catch |err| {
+                std.log.err("rmt: can't start a thread for a connection: {s}", .{@errorName(err)});
+                stream.close(self.io);
+                continue;
             };
+            thread.detach();
         }
     }
 
+    fn handle_connection(self: *Self, stream: net.Stream) void {
+        defer stream.close(self.io);
+        self.handle(stream) catch |err| switch (err) {
+            error.AuthFailed => std.log.warn("rmt: rejected connection with the wrong key", .{}),
+            else => std.log.err("rmt: failed to handle packet: {any}", .{err}),
+        };
+    }
+
     pub fn handle(self: *Self, stream: net.Stream) !void {
+        try auth.server_handshake(self.io, &self.key, stream);
+
         var rbuff: [1024]u8 = undefined;
         var reader = stream.reader(self.io, &rbuff);
         const r = &reader.interface;
 
-        const packet = try read_packet(r);
+        const packet = try wire.read_packet(r);
 
         const command = std.enums.fromInt(RmtCommands, packet.command) orelse return error.UnknownCommand;
 
         switch (command) {
             .RMT_UP => try self.handle_up(packet, stream),
             .RMT_LS => {
-                const payload = try read_payload(self.allocator, packet, r);
+                const payload = try self.read_payload(packet, r);
                 defer payload.deinit();
+                self.files_lock.lockUncancelable(self.io);
+                defer self.files_lock.unlock(self.io);
                 try self.handle_ls(packet, payload.bytes, stream);
             },
             .RMT_FR => {
-                const payload = try read_payload(self.allocator, packet, r);
+                const payload = try self.read_payload(packet, r);
                 defer payload.deinit();
+                self.files_lock.lockUncancelable(self.io);
+                defer self.files_lock.unlock(self.io);
                 try self.handle_fr(packet, payload.bytes, stream);
             },
-            .RMT_FN => return error.UnsupportedCommand,
+            .RMT_FN => {
+                const payload = try self.read_payload(packet, r);
+                defer payload.deinit();
+                self.files_lock.lockUncancelable(self.io);
+                defer self.files_lock.unlock(self.io);
+                try self.handle_fn(packet, payload.bytes, stream);
+            },
+            .RMT_FD => {
+                const payload = try self.read_payload(packet, r);
+                defer payload.deinit();
+                self.files_lock.lockUncancelable(self.io);
+                defer self.files_lock.unlock(self.io);
+                try self.handle_fd(packet, payload.bytes, stream);
+            },
+            .RMT_RUN => {
+                const payload = try self.read_payload(packet, r);
+                defer payload.deinit();
+                try self.handle_run(packet, payload.bytes, stream);
+            },
+            .RMT_FWD => try self.handle_forward(packet, r, stream),
             .RMT_DOWN => return error.UnsupportedCommand,
         }
     }
 
-    fn reply_packet(request: Packet) Packet {
-        return .{
-            .magic = 0xAF,
-            .token = request.token,
-            .command = request.command,
-        };
+    fn read_payload(self: *Self, packet: Packet, r: *std.Io.Reader) !Serializer.Bytes {
+        if (packet.transfer_len - Packet.wire_size > self.max_payload) return error.PayloadTooLarge;
+        return wire.read_payload(self.allocator, packet, r);
     }
 
     fn handle_up(self: *Self, request: Packet, stream: net.Stream) !void {
-        try write_packet(self.io, reply_packet(request), stream);
+        try wire.write_packet(self.io, wire.reply_packet(request), stream);
     }
 
     fn handle_fr(self: *Self, request: Packet, payload: []const u8, stream: net.Stream) !void {
+        const file = try Serializer.bytes_to_file_payload(payload);
+
+        const new_hash = try self.file_handler.replace_file(file.name, request.args.hash, file.data);
+
+        var packet = wire.reply_packet(request);
+        packet.args.hash = new_hash;
+        try wire.write_packet(self.io, packet, stream);
+    }
+
+    fn handle_fd(self: *Self, request: Packet, payload: []const u8, stream: net.Stream) !void {
+        try self.file_handler.delete_file(payload, request.args.hash);
+
+        var packet = wire.reply_packet(request);
+        packet.args.hash = request.args.hash;
+        try wire.write_packet(self.io, packet, stream);
+    }
+
+    /// Looks `name` up in the server's own (synced) rmtbuild.yaml, so only configured commands run.
+    /// Streams output packets, then ends with exit / signal / failed.
+    fn handle_run(self: *Self, request: Packet, name: []const u8, stream: net.Stream) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var diag: config.Diagnostic = .{};
+        const loaded = blk: {
+            self.files_lock.lockUncancelable(self.io);
+            defer self.files_lock.unlock(self.io);
+            break :blk config.Config.load(alloc, self.io, self.file_handler.root, &diag);
+        };
+        const cfg = loaded catch |err| switch (err) {
+            error.FileNotFound => return self.run_failed(request, stream, "server has no " ++ config.file_name ++ ", is it tracked by git?", .{}),
+            error.InvalidConfig => return self.run_failed(request, stream, "server's " ++ config.file_name ++ " is invalid: {f}", .{diag}),
+            else => return self.run_failed(request, stream, "can't read server's " ++ config.file_name ++ ": {s}", .{@errorName(err)}),
+        };
+
+        const command = cfg.commands.get(name) orelse
+            return self.run_failed(request, stream, "unknown command '{s}' in server's " ++ config.file_name, .{name});
+
+        var running = process.spawn(self.io, self.allocator, self.file_handler.root, self.file_handler.child_cwd(), command.run) catch |err|
+            return self.run_failed(request, stream, "failed to start '{s}': {s}", .{ name, @errorName(err) });
+        defer running.deinit();
+
+        // Long running commands (servers) may print nothing for ages, so a dropped client is
+        // noticed by watching the connection rather than by the next failed write.
+        var watch: RunWatch = .{ .io = self.io, .stream = stream, .running = &running };
+        const watcher = try std.Thread.spawn(.{}, RunWatch.run, .{&watch});
+        defer {
+            watch.finished.store(true, .release);
+            // Wakes the watcher's read once the reply is out.
+            stream.shutdown(self.io, .both) catch {};
+            watcher.join();
+        }
+
+        var client_gone = false;
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = running.output().readStreaming(self.io, &.{&buf}) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+            // Keep draining so the command never blocks on a full pipe while it's being stopped.
+            if (client_gone) continue;
+
+            self.send_output(request, buf[0..n], stream) catch {
+                client_gone = true;
+                running.stop();
+            };
+        }
+
+        const exit = try running.wait();
+        watch.finished.store(true, .release);
+        if (client_gone or watch.disconnected.load(.acquire)) {
+            std.log.info("rmt: client disconnected, stopped '{s}'", .{name});
+            return;
+        }
+
+        var packet = wire.reply_packet(request);
+        packet.args = switch (exit) {
+            .exited => |code| .{ .run = .{ .kind = .exit, .code = code } },
+            .signal => |sig| .{ .run = .{ .kind = .signal, .code = sig } },
+            .unknown => |status| return self.run_failed(request, stream, "'{s}' ended with unknown status {d}", .{ name, status }),
+        };
+        try wire.write_packet(self.io, packet, stream);
+    }
+
+    fn send_output(self: *Self, request: Packet, data: []const u8, stream: net.Stream) !void {
+        var packet = wire.reply_packet(request);
+        packet.args = .{ .run = .{ .kind = .output } };
+        try wire.append_payload_len(&packet, data.len);
+        try wire.write_packet(self.io, packet, stream);
+        try wire.write_payload(self.io, data, stream);
+    }
+
+    /// Connects to `port` on the server's own localhost and pipes bytes until both sides close.
+    /// Only localhost, so the server can't be used to reach other machines on its network.
+    fn handle_forward(self: *Self, request: Packet, r: *std.Io.Reader, stream: net.Stream) !void {
+        const port = request.args.forward.port;
+        var packet = wire.reply_packet(request);
+        packet.args = .{ .forward = .{ .port = port } };
+
+        const target = connect_localhost(self.io, port) catch |err| {
+            std.log.info("rmt: forward to port {d} refused: {s}", .{ port, @errorName(err) });
+            return wire.write_packet(self.io, packet, stream);
+        };
+        defer target.close(self.io);
+
+        packet.args.forward.ok = true;
+        try wire.write_packet(self.io, packet, stream);
+        forward.pipe(self.io, stream, r, target);
+    }
+
+    fn run_failed(self: *Self, request: Packet, stream: net.Stream, comptime fmt: []const u8, args: anytype) !void {
+        const message = try std.fmt.allocPrint(self.allocator, fmt, args);
+        defer self.allocator.free(message);
+        std.log.info("rmt: run: {s}", .{message});
+
+        var packet = wire.reply_packet(request);
+        packet.args = .{ .run = .{ .kind = .failed } };
+        try wire.append_payload_len(&packet, message.len);
+        try wire.write_packet(self.io, packet, stream);
+        try wire.write_payload(self.io, message, stream);
+    }
+
+    fn handle_fn(self: *Self, request: Packet, payload: []const u8, stream: net.Stream) !void {
+        const file = try Serializer.bytes_to_file_payload(payload);
+
+        // Check before touching the disk so a bad transfer never leaves a file behind.
         var hash: [32]u8 = undefined;
-
-        Sha256.hash(payload, &hash, .{});
-        const hash_i = std.mem.readInt(u256, &hash, .little);
-
-        const new_hash = try self.file_handler.replace_file(request.args.hash, payload);
-
-        if (new_hash != hash_i) {
+        Sha256.hash(file.data, &hash, .{});
+        if (std.mem.readInt(u256, &hash, .little) != request.args.hash) {
             return error.HashMismatch;
         }
 
-        var packet = reply_packet(request);
-        packet.args.hash = hash_i;
-        try write_packet(self.io, packet, stream);
+        const new_hash = try self.file_handler.create_file(file.name, file.data);
+
+        var packet = wire.reply_packet(request);
+        packet.args.hash = new_hash;
+        try wire.write_packet(self.io, packet, stream);
     }
 
     fn handle_ls(self: *Self, request: Packet, payload: []const u8, stream: net.Stream) !void {
         var client_hashes = try Serializer.bytes_to_string_map(u256, self.allocator, payload);
         defer client_hashes.deinit();
 
-        var changed: std.ArrayList([]const u8) = .empty;
-        defer changed.deinit(self.allocator);
+        var missing: std.ArrayList([]const u8) = .empty;
+        defer missing.deinit(self.allocator);
+        var changed = std.StringHashMap(u256).init(self.allocator);
+        defer changed.deinit();
+        var extra = std.StringHashMap(u256).init(self.allocator);
+        defer extra.deinit();
 
         try self.file_handler.source_git_files();
         try self.file_handler.hash_files();
         const server_hashes = self.file_handler.get_hashes();
 
-        var it = client_hashes.iterator();
-        while (it.next()) |entry| {
-            const server_hash = server_hashes.get(entry.key_ptr.*);
-            if (server_hash == null or server_hash.? != entry.value_ptr.*) {
-                try changed.append(self.allocator, entry.key_ptr.*);
+        var client_it = client_hashes.iterator();
+        while (client_it.next()) |entry| {
+            if (server_hashes.get(entry.key_ptr.*)) |server_hash| {
+                if (server_hash != entry.value_ptr.*) try changed.put(entry.key_ptr.*, server_hash);
+            } else {
+                try missing.append(self.allocator, entry.key_ptr.*);
             }
         }
 
-        var serialized = try Serializer.string_list_to_bytes(self.allocator, changed.items);
+        var server_it = server_hashes.iterator();
+        while (server_it.next()) |entry| {
+            if (!client_hashes.contains(entry.key_ptr.*)) try extra.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        var serialized = try LsResult.encode(self.allocator, missing.items, changed, extra);
         defer serialized.deinit();
 
-        var packet = reply_packet(request);
-        RmtHandler.append_payload_len(&packet, serialized.bytes.len);
+        var packet = wire.reply_packet(request);
+        try wire.append_payload_len(&packet, serialized.bytes.len);
 
-        try write_packet(self.io, packet, stream);
-        try write_payload(self.io, serialized, stream);
+        try wire.write_packet(self.io, packet, stream);
+        try wire.write_payload(self.io, serialized.bytes, stream);
     }
 };
 
-fn write_packet(io: std.Io, packet: Packet, stream: net.Stream) !void {
-    var bytes: [Packet.wire_size]u8 = undefined;
-    var wbuff: [Packet.wire_size]u8 = undefined;
-    std.mem.writeInt(Packet.Int, &bytes, @bitCast(packet), .little);
-    var writer = stream.writer(io, &wbuff);
-    const w = &writer.interface;
-    try w.writeAll(&bytes);
-    try w.flush();
-}
-
-fn write_payload(io: std.Io, payload: Serializer.Bytes, stream: net.Stream) !void {
-    var wbuff: [128]u8 = undefined;
-    var writer = stream.writer(io, &wbuff);
-    const w = &writer.interface;
-    try w.writeAll(payload.bytes);
-    try w.flush();
-}
-
-fn read_packet(r: *std.Io.Reader) !Packet {
-    const packet: Packet = @bitCast(try r.takeInt(Packet.Int, .little));
-
-    if (packet.magic != 0xAF) return error.InvalidMagic;
-    if (packet.transfer_len < Packet.wire_size) return error.InvalidTransferLen;
-
-    return packet;
-}
-
-fn read_payload(alloc: std.mem.Allocator, packet: Packet, r: *std.Io.Reader) !Serializer.Bytes {
-    return .init(alloc, try r.readAlloc(alloc, packet.transfer_len - Packet.wire_size));
-}
-
-fn runRmt(rmt: *RmtHandler, err_out: *?anyerror) void {
-    rmt.up() catch |err| {
-        err_out.* = err;
-    };
-}
-
-test "UP Command" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const alloc = arena.allocator();
-
-    const addr = try net.IpAddress.parse("0.0.0.0", 8099);
-    var listen = try addr.listen(std.testing.io, .{ .kernel_backlog = 64, .mode = .stream, .protocol = .tcp, .reuse_address = true });
-    defer listen.deinit(std.testing.io);
-
-    var rmt: RmtHandler = try RmtHandler.init(alloc, std.testing.io, .{ .address = "0.0.0.0", .port = 8099 });
-
-    var rmt_err: ?anyerror = null;
-
-    const thread = try std.Thread.spawn(.{}, runRmt, .{ &rmt, &rmt_err });
-
-    var stream = try listen.accept(std.testing.io);
-    defer stream.close(std.testing.io);
-
-    var rbuff: [Packet.wire_size]u8 = undefined;
-
-    var reader = stream.reader(std.testing.io, &rbuff);
-    const packet = try read_packet(&reader.interface);
-
-    try write_packet(std.testing.io, RmtServer.reply_packet(packet), stream);
-
-    thread.join();
-
-    if (rmt_err) |e| return e;
-
-    try std.testing.expect(packet.magic == 0xAF);
-    try std.testing.expect(packet.command == @intFromEnum(RmtCommands.RMT_UP));
-}
-
-fn runRmtLs(rmt: *RmtHandler, file: *FileHandler, out: *?ChangedFiles, err_out: *?anyerror) void {
-    out.* = rmt.ls(file) catch |err| {
-        err_out.* = err;
-        return;
-    };
-}
-
-test "LS Command" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const alloc = arena.allocator();
-
-    const addr = try net.IpAddress.parse("0.0.0.0", 8099);
-    var listen = try addr.listen(std.testing.io, .{ .kernel_backlog = 64, .mode = .stream, .protocol = .tcp, .reuse_address = true });
-    defer listen.deinit(std.testing.io);
-
-    var rmt: RmtHandler = try RmtHandler.init(alloc, std.testing.io, .{ .address = "0.0.0.0", .port = 8099 });
-
-    var rmt_err: ?anyerror = null;
-
-    var file: FileHandler = .init(std.testing.allocator, std.testing.io);
-    defer file.deinit();
-
-    try file.source_git_files();
-    try file.hash_files();
-
-    var changed: ?ChangedFiles = null;
-
-    const thread = try std.Thread.spawn(.{}, runRmtLs, .{ &rmt, &file, &changed, &rmt_err });
-
-    var stream = try listen.accept(std.testing.io);
-    defer stream.close(std.testing.io);
-
-    var rbuff: [Packet.wire_size]u8 = undefined;
-
-    var reader = stream.reader(std.testing.io, &rbuff);
-
-    const packet = try read_packet(&reader.interface);
-
-    const payload = try read_payload(alloc, packet, &reader.interface);
-
-    var map = try Serializer.bytes_to_string_map(u256, std.testing.allocator, payload.bytes);
-    defer map.deinit();
-
-    const reply_files = try Serializer.string_list_to_bytes(alloc, &.{"build.zig"});
-    var reply = RmtServer.reply_packet(packet);
-    RmtHandler.append_payload_len(&reply, reply_files.bytes.len);
-    try write_packet(std.testing.io, reply, stream);
-    try write_payload(std.testing.io, reply_files, stream);
-
-    thread.join();
-
-    if (rmt_err) |e| return e;
-
-    try std.testing.expect(changed.?.files.items.len == 1);
-    try std.testing.expectEqualStrings("build.zig", changed.?.files.items[0]);
-
-    try std.testing.expect(packet.magic == 0xAF);
-    try std.testing.expect(packet.command == @intFromEnum(RmtCommands.RMT_LS));
-
-    const test_hash = file.get_hashes().get("test.txt").?;
-    const test_hash_rmt = map.get("test.txt").?;
-
-    try std.testing.expect(test_hash == test_hash_rmt);
-}
-
-fn runServerOnce(server: *RmtServer, listen: *net.Server, err_out: *?anyerror) void {
-    const stream = listen.accept(server.io) catch |err| {
-        err_out.* = err;
-        return;
-    };
-    defer stream.close(server.io);
-
-    server.handle(stream) catch |err| {
-        err_out.* = err;
-    };
-}
-
-test "Server UP Command" {
-    const addr = try net.IpAddress.parse("127.0.0.1", 8100);
-    var listen = try addr.listen(std.testing.io, .{ .kernel_backlog = 64, .mode = .stream, .protocol = .tcp, .reuse_address = true });
-    defer listen.deinit(std.testing.io);
-
-    var file: FileHandler = .init(std.testing.allocator, std.testing.io);
-    defer file.deinit();
-
-    var server: RmtServer = .init(std.testing.allocator, std.testing.io, &file);
-    var server_err: ?anyerror = null;
-
-    const thread = try std.Thread.spawn(.{}, runServerOnce, .{ &server, &listen, &server_err });
-
-    const stream = try addr.connect(std.testing.io, .{ .mode = .stream });
-    defer stream.close(std.testing.io);
-
-    try write_packet(std.testing.io, .{ .magic = 0xAF, .token = 42, .command = @intFromEnum(RmtCommands.RMT_UP) }, stream);
-
-    var rbuff: [Packet.wire_size]u8 = undefined;
-    var reader = stream.reader(std.testing.io, &rbuff);
-    const reply = try read_packet(&reader.interface);
-
-    thread.join();
-
-    if (server_err) |e| return e;
-
-    try std.testing.expect(reply.magic == 0xAF);
-    try std.testing.expect(reply.token == 42);
-    try std.testing.expect(reply.command == @intFromEnum(RmtCommands.RMT_UP));
-}
-
-test "Server LS Command" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const alloc = arena.allocator();
-
-    const addr = try net.IpAddress.parse("127.0.0.1", 8101);
-    var listen = try addr.listen(std.testing.io, .{ .kernel_backlog = 64, .mode = .stream, .protocol = .tcp, .reuse_address = true });
-    defer listen.deinit(std.testing.io);
-
-    var file: FileHandler = .init(std.testing.allocator, std.testing.io);
-    defer file.deinit();
-
-    try file.source_git_files();
-    try file.hash_files();
-
-    var server: RmtServer = .init(std.testing.allocator, std.testing.io, &file);
-    var server_err: ?anyerror = null;
-
-    // Client view: test.txt matches, build.zig differs, missing.txt doesn't exist on the server.
-    var client_hashes = std.StringHashMap(u256).init(alloc);
-    try client_hashes.put("test.txt", file.get_hashes().get("test.txt").?);
-    try client_hashes.put("build.zig", 0);
-    try client_hashes.put("missing.txt", 1234);
-
-    const serialized = try Serializer.string_map_to_bytes(u256, alloc, client_hashes);
-
-    const thread = try std.Thread.spawn(.{}, runServerOnce, .{ &server, &listen, &server_err });
-
-    const stream = try addr.connect(std.testing.io, .{ .mode = .stream });
-    defer stream.close(std.testing.io);
-
-    var packet: Packet = .{ .magic = 0xAF, .token = 7, .command = @intFromEnum(RmtCommands.RMT_LS) };
-    RmtHandler.append_payload_len(&packet, serialized.bytes.len);
-    try write_packet(std.testing.io, packet, stream);
-    try write_payload(std.testing.io, serialized, stream);
-
-    var rbuff: [256]u8 = undefined;
-    var reader = stream.reader(std.testing.io, &rbuff);
-    const reply = try read_packet(&reader.interface);
-    const payload = try read_payload(alloc, reply, &reader.interface);
-
-    thread.join();
-
-    if (server_err) |e| return e;
-
-    try std.testing.expect(reply.magic == 0xAF);
-    try std.testing.expect(reply.token == 7);
-    try std.testing.expect(reply.command == @intFromEnum(RmtCommands.RMT_LS));
-
-    const changed = try Serializer.bytes_to_string_list(alloc, payload.bytes);
-
-    try std.testing.expect(changed.items.len == 2);
-    for (changed.items) |name| {
-        try std.testing.expect(std.mem.eql(u8, name, "build.zig") or std.mem.eql(u8, name, "missing.txt"));
+/// Watches a RUN connection: the client sends nothing after its request, so any end of stream
+/// means it went away, and the command is stopped.
+const RunWatch = struct {
+    io: std.Io,
+    stream: net.Stream,
+    running: *const process.Running,
+    finished: std.atomic.Value(bool) = .init(false),
+    disconnected: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *RunWatch) void {
+        var buf: [64]u8 = undefined;
+        var reader = self.stream.reader(self.io, &buf);
+        while (true) {
+            reader.interface.fillMore() catch break;
+            reader.interface.tossBuffered();
+        }
+        if (self.finished.load(.acquire)) return;
+
+        self.disconnected.store(true, .release);
+        self.running.stop();
+
+        // Give it a few seconds to shut down cleanly before forcing it.
+        for (0..50) |_| {
+            if (self.finished.load(.acquire)) return;
+            self.io.sleep(.fromMilliseconds(100), .awake) catch return;
+        }
+        self.running.kill();
     }
+};
+
+/// Makes `rmtbuild serve` stop running commands before it exits.
+pub const stop_commands_on_exit = process.stop_all_on_exit;
+
+fn connect_localhost(io: std.Io, port: u16) !net.Stream {
+    // Servers often bind only one of the two loopback addresses.
+    const v4 = try net.IpAddress.parse("127.0.0.1", port);
+    return v4.connect(io, .{ .mode = .stream }) catch {
+        const v6 = try net.IpAddress.parse("::1", port);
+        return v6.connect(io, .{ .mode = .stream });
+    };
 }
