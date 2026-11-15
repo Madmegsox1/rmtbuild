@@ -25,6 +25,16 @@ pub const Running = struct {
         return self.child.stdout.?;
     }
 
+    /// The write end of the child's stdin, when spawned with `stdin = .pipe`.
+    pub fn input(self: *Running) ?std.Io.File {
+        return self.child.stdin;
+    }
+
+    /// The read end of the child's stderr, when spawned with `stderr = .pipe`.
+    pub fn error_output(self: *Running) ?std.Io.File {
+        return self.child.stderr;
+    }
+
     /// Asks the whole tree to stop (SIGTERM). Windows has no polite equivalent, so it's killed.
     /// Safe to call from another thread.
     pub fn stop(self: *const Running) void {
@@ -64,6 +74,26 @@ pub fn spawn(io: std.Io, allocator: std.mem.Allocator, root: std.Io.Dir, cwd: st
         spawn_posix(io, allocator, cwd, script);
 }
 
+pub const ArgvOptions = struct {
+    stdin: enum { ignore, pipe } = .ignore,
+    stderr: enum { inherit, pipe } = .inherit,
+};
+
+/// Runs `argv` directly (no shell), in a process group / job so `Running.deinit` stops the tree.
+/// `argv` is not copied; it only needs to live until this returns.
+pub fn spawn_argv(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cwd: std.process.Child.Cwd,
+    argv: []const []const u8,
+    opts: ArgvOptions,
+) !Running {
+    return if (is_windows)
+        spawn_argv_windows(io, allocator, cwd, argv, opts)
+    else
+        spawn_argv_posix(io, cwd, argv, opts);
+}
+
 /// Makes the server stop running commands before it exits.
 pub fn stop_all_on_exit() void {
     // Windows: nothing to do, closing the server closes its job handles, which kills them.
@@ -74,6 +104,19 @@ const Tree = if (is_windows) WindowsTree else PosixTree;
 const Signal = enum { stop, kill };
 
 // ---------------------------------------------------------------- POSIX
+
+fn spawn_argv_posix(io: std.Io, cwd: std.process.Child.Cwd, argv: []const []const u8, opts: ArgvOptions) !Running {
+    const child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = cwd,
+        .stdin = if (opts.stdin == .pipe) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = if (opts.stderr == .pipe) .pipe else .inherit,
+        .pgid = 0,
+    });
+    posix.track(child.id.?);
+    return .{ .io = io, .child = child, .tree = .{ .pgid = child.id.? } };
+}
 
 fn spawn_posix(io: std.Io, allocator: std.mem.Allocator, cwd: std.process.Child.Cwd, script: []const u8) !Running {
     const full = try std.fmt.allocPrint(allocator, "exec 2>&1\n{s}", .{script});
@@ -180,13 +223,8 @@ fn spawn_windows(io: std.Io, allocator: std.mem.Allocator, root: std.Io.Dir, cwd
     };
     errdefer root.deleteFile(io, path) catch {};
 
-    const job = win.CreateJobObjectW(null, null) orelse return error.JobObjectFailed;
+    const job = try create_kill_job();
     errdefer std.os.windows.CloseHandle(job);
-
-    var limits = std.mem.zeroes(win.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
-    limits.BasicLimitInformation.LimitFlags = win.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (!win.SetInformationJobObject(job, win.JobObjectExtendedLimitInformation, &limits, @sizeOf(@TypeOf(limits))).toBool())
-        return error.JobObjectFailed;
 
     var child = try std.process.spawn(io, .{
         // /d skips AutoRun registry commands. "2>&1" applies to the whole batch file.
@@ -203,6 +241,47 @@ fn spawn_windows(io: std.Io, allocator: std.mem.Allocator, root: std.Io.Dir, cwd
     if (win.ResumeThread(child.thread_handle) == std.math.maxInt(u32)) return error.ResumeFailed;
 
     return .{ .io = io, .child = child, .tree = .{ .job = job, .root = root, .script = path, .allocator = allocator } };
+}
+
+fn spawn_argv_windows(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cwd: std.process.Child.Cwd,
+    argv: []const []const u8,
+    opts: ArgvOptions,
+) !Running {
+    const job = try create_kill_job();
+    errdefer std.os.windows.CloseHandle(job);
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = cwd,
+        .stdin = if (opts.stdin == .pipe) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = if (opts.stderr == .pipe) .pipe else .inherit,
+        .start_suspended = true,
+    });
+    errdefer child.kill(io);
+
+    if (!win.AssignProcessToJobObject(job, child.id.?).toBool()) return error.JobObjectFailed;
+    if (win.ResumeThread(child.thread_handle) == std.math.maxInt(u32)) return error.ResumeFailed;
+
+    return .{
+        .io = io,
+        .child = child,
+        .tree = .{ .job = job, .root = std.Io.Dir.cwd(), .script = null, .allocator = allocator },
+    };
+}
+
+fn create_kill_job() !std.os.windows.HANDLE {
+    const job = win.CreateJobObjectW(null, null) orelse return error.JobObjectFailed;
+    errdefer std.os.windows.CloseHandle(job);
+
+    var limits = std.mem.zeroes(win.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+    limits.BasicLimitInformation.LimitFlags = win.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!win.SetInformationJobObject(job, win.JobObjectExtendedLimitInformation, &limits, @sizeOf(@TypeOf(limits))).toBool())
+        return error.JobObjectFailed;
+    return job;
 }
 
 /// `@echo off` so commands aren't echoed (like sh), and CRLF line endings because cmd's labels and
@@ -222,7 +301,8 @@ fn batch_file(allocator: std.mem.Allocator, script: []const u8) ![]u8 {
 const WindowsTree = struct {
     job: std.os.windows.HANDLE,
     root: std.Io.Dir,
-    script: []u8,
+    /// Batch file to delete, when the tree was started from a script rather than `spawn_argv`.
+    script: ?[]u8,
     allocator: std.mem.Allocator,
 
     fn signal(self: WindowsTree, how: Signal) void {
@@ -233,8 +313,10 @@ const WindowsTree = struct {
     fn deinit(self: WindowsTree, io: std.Io) void {
         // Kills anything the command left running (KILL_ON_JOB_CLOSE).
         std.os.windows.CloseHandle(self.job);
-        self.root.deleteFile(io, self.script) catch {};
-        self.allocator.free(self.script);
+        if (self.script) |script| {
+            self.root.deleteFile(io, script) catch {};
+            self.allocator.free(script);
+        }
     }
 };
 
@@ -294,6 +376,25 @@ test "batch file conversion" {
     const out = try batch_file(std.testing.allocator, "echo a\nif 1==1 (\n  echo b\r\n)");
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("@echo off\r\necho a\r\nif 1==1 (\r\n  echo b\r\n)\r\n", out);
+}
+
+test "spawn_argv" {
+    const io = std.testing.io;
+    const argv: []const []const u8 = if (is_windows)
+        &.{ "cmd.exe", "/d", "/c", "echo hi" }
+    else
+        &.{ "echo", "hi" };
+
+    var running = try spawn_argv(io, std.testing.allocator, .inherit, argv, .{});
+    defer running.deinit();
+
+    var buf: [64]u8 = undefined;
+    var reader = running.output().reader(io, &buf);
+    var out: [64]u8 = undefined;
+    const n = try reader.interface.readSliceShort(&out);
+    const expected = if (is_windows) "hi\r\n" else "hi\n";
+    try std.testing.expectEqualStrings(expected, out[0..n]);
+    try std.testing.expectEqual(Exit{ .exited = 0 }, try running.wait());
 }
 
 test "spawn, output and exit code" {

@@ -20,6 +20,14 @@
 //!   web:
 //!     run: zig build run
 //!     forward: 8080        # or "8080, 3000", or "8081:8080" for local:remote
+//!   framework:
+//!     run: |
+//!       msbuild App.csproj /p:Configuration=Debug
+//!       bin\Debug\App.exe
+//!     debug:                 # or `debug: rider` for the defaults
+//!       mode: rider          # rider | msvsmon | mdbg
+//!       port: 7777           # server listen port, forwarded to the client
+//!       agent: C:\Tools\jetbrains_debugger_agent.exe
 //! ```
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -53,6 +61,33 @@ pub const Command = struct {
     run: []const u8,
     /// Server ports made reachable on the client's localhost while the command runs.
     forward: []const Forward = &.{},
+    /// Remote debugger for this command. .NET Framework debugging runs on a Windows server.
+    debug: ?Debug = null,
+};
+
+pub const DebugMode = enum { rider, msvsmon, mdbg };
+
+pub const default_rider_port: u16 = 7777;
+pub const default_msvsmon_port: u16 = 4026;
+
+pub const Debug = struct {
+    mode: DebugMode,
+    /// Server port the debugger listens on. Null for `mdbg`, which has no listen port.
+    port: ?u16 = null,
+    /// Client localhost port. Null means the same as `port`.
+    local: ?u16 = null,
+    /// Path of the helper on the server. Null means the mode's env var, then a default name.
+    agent: ?[]const u8 = null,
+    /// When false, don't start a helper; something is already listening (OpenSSH, a running msvsmon).
+    start: bool = true,
+    /// Program `mdbg` launches after `run` exits 0.
+    program: ?[]const u8 = null,
+    args: []const []const u8 = &.{},
+
+    pub fn client_forward(self: Debug) ?Forward {
+        const remote = self.port orelse return null;
+        return .{ .local = self.local orelse remote, .remote = remote };
+    }
 };
 
 pub const Forward = struct {
@@ -163,6 +198,7 @@ pub const Config = struct {
 
             var run: ?[]const u8 = null;
             var forward: []const Forward = &.{};
+            var debug: ?Debug = null;
             var field_it = fields.iterator();
             while (field_it.next()) |field| {
                 if (std.mem.eql(u8, field.key_ptr.*, "run")) {
@@ -174,8 +210,10 @@ pub const Config = struct {
                         error.DuplicatePort => return fail_fmt(arena, diag, "{s}.forward: '{s}' uses a local port twice", .{ path, text }),
                         error.InvalidPort => return fail_fmt(arena, diag, "{s}.forward: '{s}' should be ports like '8080', '8080, 3000' or '8081:8080'", .{ path, text }),
                     };
+                } else if (std.mem.eql(u8, field.key_ptr.*, "debug")) {
+                    debug = try self.parse_debug(arena, path, field.value_ptr.*, diag);
                 } else {
-                    return fail_fmt(arena, diag, "{s}: unknown key '{s}', expected 'run' or 'forward'", .{ path, field.key_ptr.* });
+                    return fail_fmt(arena, diag, "{s}: unknown key '{s}', expected 'run', 'forward' or 'debug'", .{ path, field.key_ptr.* });
                 }
             }
 
@@ -183,8 +221,66 @@ pub const Config = struct {
             if (std.mem.trim(u8, script, " \t\n").len == 0)
                 return fail_fmt(arena, diag, "{s}.run is empty", .{path});
 
-            try self.commands.put(arena, name, .{ .run = script, .forward = forward });
+            if (debug) |dbg| if (dbg.client_forward()) |fwd| {
+                for (forward) |existing| if (existing.local == fwd.local) {
+                    return fail_fmt(arena, diag, "{s}.debug: local port {d} is already in 'forward'", .{ path, fwd.local });
+                };
+            };
+
+            try self.commands.put(arena, name, .{ .run = script, .forward = forward, .debug = debug });
         }
+    }
+
+    fn parse_debug(self: *Config, arena: Allocator, path: []const u8, node: Node, diag: *Diagnostic) !Debug {
+        _ = self;
+        const debug_path = try std.fmt.allocPrint(arena, "{s}.debug", .{path});
+
+        if (node == .scalar) {
+            const mode = try parse_debug_mode(arena, debug_path, node.scalar, diag);
+            return finish_debug(arena, debug_path, mode, null, null, null, true, null, &.{}, diag);
+        }
+
+        const fields = try expect_map(arena, node, debug_path, diag);
+        var mode: ?DebugMode = null;
+        var port: ?u16 = null;
+        var local: ?u16 = null;
+        var agent: ?[]const u8 = null;
+        var program: ?[]const u8 = null;
+        var args: []const []const u8 = &.{};
+        var start: ?bool = null;
+
+        var it = fields.iterator();
+        while (it.next()) |field| {
+            const key = field.key_ptr.*;
+            const value = try expect_scalar(arena, field.value_ptr.*, debug_path, key, diag);
+            if (std.mem.eql(u8, key, "mode")) {
+                mode = try parse_debug_mode(arena, debug_path, value, diag);
+            } else if (std.mem.eql(u8, key, "port") or std.mem.eql(u8, key, "local")) {
+                const number = std.fmt.parseInt(u16, value, 10) catch 0;
+                if (number == 0) return fail_fmt(arena, diag, "{s}.{s}: '{s}' isn't a port", .{ debug_path, key, value });
+                if (std.mem.eql(u8, key, "port")) port = number else local = number;
+            } else if (std.mem.eql(u8, key, "agent")) {
+                if (value.len == 0) return fail_fmt(arena, diag, "{s}.agent is empty", .{debug_path});
+                agent = value;
+            } else if (std.mem.eql(u8, key, "program")) {
+                if (value.len == 0) return fail_fmt(arena, diag, "{s}.program is empty", .{debug_path});
+                program = value;
+            } else if (std.mem.eql(u8, key, "args")) {
+                args = split_debug_args(arena, value) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.UnterminatedQuote => return fail_fmt(arena, diag, "{s}.args: unterminated quote in '{s}'", .{ debug_path, value }),
+                };
+            } else if (std.mem.eql(u8, key, "start")) {
+                if (std.mem.eql(u8, value, "true")) start = true else if (std.mem.eql(u8, value, "false")) start = false else {
+                    return fail_fmt(arena, diag, "{s}.start: '{s}' should be true or false", .{ debug_path, value });
+                }
+            } else {
+                return fail_fmt(arena, diag, "{s}: unknown key '{s}', expected 'mode', 'port', 'local', 'agent', 'program', 'args' or 'start'", .{ debug_path, key });
+            }
+        }
+
+        const parsed_mode = mode orelse return fail_fmt(arena, diag, "{s}: missing 'mode' (rider, msvsmon or mdbg)", .{debug_path});
+        return finish_debug(arena, debug_path, parsed_mode, port, local, agent, start orelse true, program, args, diag);
     }
 
     fn expect_map(arena: Allocator, node: Node, path: []const u8, diag: *Diagnostic) !Node.Map {
@@ -201,6 +297,75 @@ pub const Config = struct {
         };
     }
 };
+
+fn parse_debug_mode(arena: Allocator, path: []const u8, text: []const u8, diag: *Diagnostic) !DebugMode {
+    if (std.mem.eql(u8, text, "rider")) return .rider;
+    if (std.mem.eql(u8, text, "msvsmon")) return .msvsmon;
+    if (std.mem.eql(u8, text, "mdbg")) return .mdbg;
+    return fail_fmt(arena, diag, "{s}: '{s}' isn't a debug mode (rider, msvsmon or mdbg)", .{ path, text });
+}
+
+fn finish_debug(
+    arena: Allocator,
+    path: []const u8,
+    mode: DebugMode,
+    port: ?u16,
+    local: ?u16,
+    agent: ?[]const u8,
+    start: bool,
+    program: ?[]const u8,
+    args: []const []const u8,
+    diag: *Diagnostic,
+) !Debug {
+    switch (mode) {
+        .mdbg => {
+            if (!start) return fail_fmt(arena, diag, "{s}: mdbg always starts the debugger, remove 'start'", .{path});
+            if (port != null or local != null) return fail_fmt(arena, diag, "{s}: mdbg has no listen port, remove 'port' and 'local'", .{path});
+            if (args.len != 0 and program == null) return fail_fmt(arena, diag, "{s}: 'args' needs 'program'", .{path});
+            const exe = program orelse return fail_fmt(arena, diag, "{s}: mdbg needs 'program' (launched after 'run' exits 0)", .{path});
+            return .{ .mode = mode, .agent = agent, .program = exe, .args = args };
+        },
+        .rider, .msvsmon => {
+            if (program != null or args.len != 0) return fail_fmt(arena, diag, "{s}: 'program' and 'args' are only for mdbg", .{path});
+            const chosen = port orelse switch (mode) {
+                .rider => default_rider_port,
+                .msvsmon => default_msvsmon_port,
+                .mdbg => unreachable,
+            };
+            return .{
+                .mode = mode,
+                .port = chosen,
+                .local = local orelse chosen,
+                .agent = agent,
+                .start = start,
+            };
+        },
+    }
+}
+
+/// Whitespace-separated, with `'...'` and `"..."` quoting. No escapes.
+fn split_debug_args(arena: Allocator, text: []const u8) error{ UnterminatedQuote, OutOfMemory }![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+        if (i >= text.len) break;
+        if (text[i] == '"' or text[i] == '\'') {
+            const quote = text[i];
+            i += 1;
+            const start = i;
+            while (i < text.len and text[i] != quote) i += 1;
+            if (i >= text.len) return error.UnterminatedQuote;
+            try list.append(arena, text[start..i]);
+            i += 1;
+        } else {
+            const start = i;
+            while (i < text.len and text[i] != ' ' and text[i] != '\t') i += 1;
+            try list.append(arena, text[start..i]);
+        }
+    }
+    return list.items;
+}
 
 fn fail_fmt(arena: Allocator, diag: *Diagnostic, comptime fmt: []const u8, args: anytype) error{ InvalidConfig, OutOfMemory } {
     diag.* = .{ .message = try std.fmt.allocPrint(arena, fmt, args) };
@@ -502,6 +667,63 @@ test "Config full example" {
     try std.testing.expectEqualSlices(Forward, &.{ .{ .local = 8080, .remote = 8080 }, .{ .local = 3001, .remote = 3000 } }, forward);
 }
 
+test "Config debug" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const config = try test_parse(arena.allocator(),
+        \\commands:
+        \\  app:
+        \\    run: bin\Debug\App.exe
+        \\    forward: 8080
+        \\    debug:
+        \\      mode: rider
+        \\      port: 7777
+        \\      local: 7000
+        \\      agent: C:\Tools\jetbrains_debugger_agent.exe
+        \\  vs:
+        \\    run: bin\Debug\App.exe
+        \\    debug: msvsmon
+        \\  cli:
+        \\    run: msbuild App.csproj
+        \\    debug:
+        \\      mode: mdbg
+        \\      program: bin\Debug\App.exe
+        \\      args: --one "two three"
+        \\  ssh:
+        \\    run: bin\Debug\App.exe
+        \\    debug:
+        \\      mode: rider
+        \\      port: 22
+        \\      start: false
+        \\
+    );
+
+    const app = config.commands.get("app").?.debug.?;
+    try std.testing.expectEqual(DebugMode.rider, app.mode);
+    try std.testing.expectEqual(@as(?u16, 7777), app.port);
+    try std.testing.expectEqual(@as(?u16, 7000), app.local);
+    try std.testing.expectEqualStrings("C:\\Tools\\jetbrains_debugger_agent.exe", app.agent.?);
+    try std.testing.expectEqual(Forward{ .local = 7000, .remote = 7777 }, app.client_forward().?);
+
+    const vs = config.commands.get("vs").?.debug.?;
+    try std.testing.expectEqual(DebugMode.msvsmon, vs.mode);
+    try std.testing.expectEqual(@as(?u16, default_msvsmon_port), vs.port);
+    try std.testing.expect(vs.start);
+
+    const cli = config.commands.get("cli").?.debug.?;
+    try std.testing.expectEqual(DebugMode.mdbg, cli.mode);
+    try std.testing.expect(cli.port == null);
+    try std.testing.expectEqualStrings("bin\\Debug\\App.exe", cli.program.?);
+    try std.testing.expectEqual(@as(usize, 2), cli.args.len);
+    try std.testing.expectEqualStrings("--one", cli.args[0]);
+    try std.testing.expectEqualStrings("two three", cli.args[1]);
+
+    const ssh = config.commands.get("ssh").?.debug.?;
+    try std.testing.expect(!ssh.start);
+    try std.testing.expectEqual(@as(?u16, 22), ssh.port);
+}
+
 test "Config defaults" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -544,4 +766,10 @@ test "Config errors" {
     try expect_config_error("commands:\n  web:\n    run: x\n    forward: 0\n", 0, "should be ports");
     try expect_config_error("commands:\n  web:\n    run: x\n    forward: 8080, 8080:9000\n", 0, "local port twice");
     try expect_config_error("commands:\n  build: zig build\n", 0, "expected nested keys");
+    try expect_config_error("commands:\n  app:\n    run: x\n    debug: nope\n", 0, "isn't a debug mode");
+    try expect_config_error("commands:\n  app:\n    run: x\n    debug:\n      mode: mdbg\n", 0, "needs 'program'");
+    try expect_config_error("commands:\n  app:\n    run: x\n    debug:\n      mode: rider\n      port: 0\n", 0, "isn't a port");
+    try expect_config_error("commands:\n  app:\n    run: x\n    debug:\n      mode: rider\n      extra: 1\n", 0, "unknown key 'extra'");
+    try expect_config_error("commands:\n  app:\n    run: x\n    forward: 7777\n    debug:\n      mode: rider\n", 0, "already in 'forward'");
+    try expect_config_error("commands:\n  app:\n    run: x\n    debug:\n      mode: rider\n      program: a.exe\n", 0, "only for mdbg");
 }

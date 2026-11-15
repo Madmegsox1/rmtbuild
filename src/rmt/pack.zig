@@ -28,6 +28,8 @@ pub const RunKind = enum(u8) {
     signal = 2,
     /// The server couldn't run the command, payload is the reason.
     failed = 3,
+    /// Payload is a debug-session notice (`mode=...` lines). Not part of the command's output.
+    notice = 4,
     _,
 };
 
