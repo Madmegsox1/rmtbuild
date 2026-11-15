@@ -184,13 +184,13 @@ These steps need a Windows machine with .NET Framework build tools and a develop
    ```
 
    Use the Windows machine's address in `server.address` when the client is a different computer. Track `rmtbuild.yaml` (`git add`).
-4. On Windows, in that checkout: `rmtbuild serve --listen 0.0.0.0 --port 8099`.
+4. On Windows, in that checkout: `rmtbuild serve --listen 0.0.0.0 --port 8099`. Leave this console visible. By default the agent password is printed only here, not on the client.
 5. On the developer machine, in a checkout of the same repo: `rmtbuild framework`.
-6. Wait until rmtbuild prints `JetBrains debugger agent is forwarded to 127.0.0.1:7777` with a user and password, and the app prints `rmtbuild: pid N waiting for a debugger`.
+6. The client warns that the password was **not** sent, and prints `Attach to Remote Process, host 127.0.0.1, port 7777`. On the server console, read the `user=` and `password=` from the warning. The app prints `rmtbuild: pid N waiting for a debugger`. To have the client print the password as well, add `allow_cleartext_password: true` under `debug` (it travels in cleartext on the unencrypted rmtbuild connection).
 7. In Rider, open the same project. Run, Attach to Remote Process. Add an SSH configuration:
    - Host `127.0.0.1`
    - Port `7777` (or whatever `local` you set)
-   - Authentication: password, the user and password from the rmtbuild banner
+   - Authentication: password, the user and password from the **server** console (or from the client banner if you opted in)
 8. Accept the upload of remote debugger tools if Rider asks. Attach to the process with that pid (or the exe name).
 9. `Debugger.Break()` should stop in `Main`. Set a breakpoint on the next line, continue, and confirm it binds. If it stays hollow, add a path mapping from the Windows repo path in the PDB to your local checkout.
 10. Stop the debug session in Rider (the process keeps running). Stop `rmtbuild framework` with Ctrl-C; the app and the agent should exit with it.

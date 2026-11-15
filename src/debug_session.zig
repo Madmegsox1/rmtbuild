@@ -282,7 +282,8 @@ pub fn listener_argv(
     return try arena.dupe([]const u8, &flags);
 }
 
-/// Argv for MDbg: `MDbg.exe <program> <args...>`.
+/// Argv for MDbg: `MDbg.exe <program> <args...>`. Not wrapped in `cmd /c`; a batch
+/// agent is started by `spawn_merged_argv`, which shares one pipe for both outputs.
 pub fn mdbg_argv(
     arena: std.mem.Allocator,
     os: std.Target.Os.Tag,
@@ -290,17 +291,11 @@ pub fn mdbg_argv(
     program: []const u8,
     args: []const []const u8,
 ) ![]const []const u8 {
-    const body_len = 2 + args.len;
-    const prefix: usize = if (os == .windows and is_batch(agent)) 3 else 0;
-    const argv = try arena.alloc([]const u8, prefix + body_len);
-    if (prefix != 0) {
-        argv[0] = "cmd.exe";
-        argv[1] = "/d";
-        argv[2] = "/c";
-    }
-    argv[prefix] = agent;
-    argv[prefix + 1] = program;
-    @memcpy(argv[prefix + 2 ..], args);
+    _ = os;
+    const argv = try arena.alloc([]const u8, 2 + args.len);
+    argv[0] = agent;
+    argv[1] = program;
+    @memcpy(argv[2..], args);
     return argv;
 }
 
@@ -546,6 +541,9 @@ test "listener and mdbg argv" {
 
     const mdbg = try mdbg_argv(a, .windows, "MDbg.exe", "bin\\Debug\\App.exe", &.{ "--x" });
     try expect_argv(&.{ "MDbg.exe", "bin\\Debug\\App.exe", "--x" }, mdbg);
+    // A .cmd agent is not wrapped in cmd /c here; that would stack with another shell.
+    const batch_mdbg = try mdbg_argv(a, .windows, "C:\\R&D\\agent.cmd", "app.exe", &.{});
+    try expect_argv(&.{ "C:\\R&D\\agent.cmd", "app.exe" }, batch_mdbg);
 
     try std.testing.expectEqualStrings("jetbrains_debugger_agent.exe", resolve_agent(.windows, .rider, null, null));
     try std.testing.expectEqualStrings("C:\\agent.exe", resolve_agent(.windows, .rider, "C:\\agent.exe", "ignored"));

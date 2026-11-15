@@ -1038,6 +1038,7 @@ const RunWatch = struct {
             }
             const n = self.pending_len;
             if (n == 0) {
+                set_stdin_nonblock(file);
                 self.stdin = file;
                 self.lock.unlock(self.io);
                 return;
@@ -1050,11 +1051,12 @@ const RunWatch = struct {
             self.pending_len = 0;
             self.lock.unlock(self.io);
             defer allocator.free(copy);
-            file.writeStreamingAll(self.io, copy) catch {
+            // Outside the lock, and non-blocking: a full pipe must not stall this thread.
+            if (write_stdin(file, copy) == .err) {
                 self.disconnected.store(true, .release);
                 running.stop();
                 return;
-            };
+            }
         }
     }
 
@@ -1074,24 +1076,33 @@ const RunWatch = struct {
 
     fn absorb(self: *RunWatch, data: []const u8) void {
         self.lock.lockUncancelable(self.io);
-        defer self.lock.unlock(self.io);
-        if (self.stdin_closed) return;
-        if (self.stdin) |file| {
-            file.writeStreamingAll(self.io, data) catch {
-                self.disconnected.store(true, .release);
-                self.running.stop();
-            };
+        if (self.stdin_closed) {
+            self.lock.unlock(self.io);
             return;
         }
-        if (!self.buffer_stdin) return;
-        const room = self.pending.len - self.pending_len;
-        if (data.len > room) {
+        const file = self.stdin;
+        if (file == null) {
+            if (self.buffer_stdin) {
+                const room = self.pending.len - self.pending_len;
+                if (data.len > room) {
+                    self.lock.unlock(self.io);
+                    self.disconnected.store(true, .release);
+                    self.current().stop();
+                    return;
+                }
+                @memcpy(self.pending[self.pending_len..][0..data.len], data);
+                self.pending_len += data.len;
+            }
+            self.lock.unlock(self.io);
+            return;
+        }
+        self.lock.unlock(self.io);
+        // A full stdin pipe must not block this thread. It is the thread that notices
+        // the client disconnect; a blocking write here wedges shutdown's join.
+        if (write_stdin(file.?, data) == .err) {
             self.disconnected.store(true, .release);
-            self.running.stop();
-            return;
+            self.current().stop();
         }
-        @memcpy(self.pending[self.pending_len..][0..data.len], data);
-        self.pending_len += data.len;
     }
 
     fn run(self: *RunWatch) void {
@@ -1167,3 +1178,57 @@ const RunWatch = struct {
 pub const stop_commands_on_exit = process.stop_all_on_exit;
 
 const connect_localhost = debug_session.connect_localhost;
+
+const StdinWrite = enum { ok, blocked, err };
+
+/// Writes what fits. A full pipe returns `.blocked` instead of waiting.
+fn write_stdin(file: std.Io.File, data: []const u8) StdinWrite {
+    if (data.len == 0) return .ok;
+    if (comptime builtin.os.tag == .windows) {
+        var wrote: std.os.windows.DWORD = 0;
+        if (!win_write.WriteFile(file.handle, data.ptr, @intCast(@min(data.len, std.math.maxInt(u32))), &wrote, null).toBool()) {
+            const err = std.os.windows.GetLastError();
+            // PIPE_NOWAIT: the buffer is full, or the reader is gone.
+            if (err == .NO_DATA or err == .PIPE_BUSY) return .blocked;
+            return .err;
+        }
+        return .ok;
+    }
+    const rc = std.posix.system.write(file.handle, data.ptr, data.len);
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS => .ok,
+        .AGAIN => .blocked,
+        else => .err,
+    };
+}
+
+fn set_stdin_nonblock(file: std.Io.File) void {
+    if (comptime builtin.os.tag == .windows) {
+        var mode: std.os.windows.DWORD = 1; // PIPE_NOWAIT
+        _ = win_write.SetNamedPipeHandleState(file.handle, &mode, null, null);
+        return;
+    }
+    const got = std.posix.system.fcntl(file.handle, std.posix.F.GETFL, 0);
+    if (std.posix.errno(got) != .SUCCESS) return;
+    const flags: usize = @intCast(got);
+    const nonblock: usize = 1 << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    _ = std.posix.system.fcntl(file.handle, std.posix.F.SETFL, flags | nonblock);
+}
+
+/// WriteFile / SetNamedPipeHandleState, used so a full MDbg stdin pipe does not block.
+const win_write = struct {
+    const windows = std.os.windows;
+    extern "kernel32" fn WriteFile(
+        handle: windows.HANDLE,
+        buf: [*]const u8,
+        len: windows.DWORD,
+        written: *windows.DWORD,
+        overlapped: ?*anyopaque,
+    ) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn SetNamedPipeHandleState(
+        handle: windows.HANDLE,
+        mode: ?*windows.DWORD,
+        max_collect: ?*windows.DWORD,
+        timeout: ?*windows.DWORD,
+    ) callconv(.winapi) windows.BOOL;
+};

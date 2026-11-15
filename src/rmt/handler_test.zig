@@ -1097,3 +1097,98 @@ test "debug failure names the env agent path" {
     try std.testing.expect(std.mem.indexOf(u8, message, fx.server.msvsmon_agent.?) != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "RMTBUILD_MSVSMON") != null);
 }
+
+fn flood_stdin(io: std.Io, stream: net.Stream) void {
+    // More than a typical pipe buffer, framed the way the mdbg client sends stdin.
+    var payload: [1024]u8 = undefined;
+    @memset(&payload, 'x');
+    var hdr: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hdr, payload.len, .little);
+    var wbuf: [64]u8 = undefined;
+    var writer = stream.writer(io, &wbuf);
+    for (0..256) |_| {
+        writer.interface.writeAll(&hdr) catch return;
+        writer.interface.writeAll(&payload) catch return;
+        writer.interface.flush() catch return;
+    }
+}
+
+test "mdbg tears down when stdin is not read" {
+    const io = std.testing.io;
+    var fx: ServerFixture = undefined;
+    try fx.init(".zig-cache/debug_stdin_block_test", 8135);
+    defer fx.deinit();
+
+    // Never reads stdin, and would outlive the client if the watcher wedged on the pipe.
+    _ = try fx.file.create_file("rmtbuild.yaml", if (is_windows)
+        \\commands:
+        \\  app:
+        \\    run: echo built
+        \\    debug:
+        \\      mode: mdbg
+        \\      agent: .\fake-mdbg.cmd
+        \\      program: ignored
+        \\
+    else
+        \\commands:
+        \\  app:
+        \\    run: echo built
+        \\    debug:
+        \\      mode: mdbg
+        \\      agent: /bin/sh
+        \\      program: fake-mdbg.sh
+        \\
+    );
+    if (is_windows) {
+        try write_executable(fx.repo.dir, io, "fake-mdbg.cmd",
+            \\@echo off
+            \\echo started
+            \\ping -n 30 127.0.0.1 >nul
+            \\
+        );
+    } else {
+        try write_executable(fx.repo.dir, io, "fake-mdbg.sh",
+            \\#!/bin/sh
+            \\echo started
+            \\sleep 30
+            \\
+        );
+    }
+
+    var server_err: ?anyerror = null;
+    const server_thread = try std.Thread.spawn(.{}, runServerOnce, .{ &fx.server, &fx.listen, &server_err });
+    const start = std.Io.Timestamp.now(io, .awake);
+
+    {
+        const addr = try net.IpAddress.parse("127.0.0.1", 8135);
+        const stream = try addr.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        try auth.client_handshake(io, &test_key, stream);
+
+        var packet: Packet = .{ .magic = 0xAF, .token = 1, .command = @intFromEnum(RmtCommands.RMT_RUN) };
+        try wire.append_payload_len(&packet, "app".len);
+        try wire.write_packet(io, packet, stream);
+        try wire.write_payload(io, "app", stream);
+
+        var rbuf: [512]u8 = undefined;
+        var reader = stream.reader(io, &rbuf);
+        // Build output, then the mdbg notice, then "started".
+        var saw_started = false;
+        while (!saw_started) {
+            const reply = try wire.read_packet(&reader.interface);
+            const payload = try wire.read_payload(std.testing.allocator, reply, &reader.interface);
+            defer payload.deinit();
+            if (std.mem.indexOf(u8, payload.bytes, "started") != null) saw_started = true;
+        }
+
+        const flood = try std.Thread.spawn(.{}, flood_stdin, .{ io, stream });
+        io.sleep(.fromMilliseconds(200), .awake) catch {};
+        stream.shutdown(io, .both) catch {};
+        flood.join();
+    }
+
+    server_thread.join();
+    if (server_err) |e| return e;
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+    try std.testing.expect(elapsed < 8_000);
+}
