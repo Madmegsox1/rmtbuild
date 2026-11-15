@@ -5,6 +5,7 @@ const config = @import("config.zig");
 const FileHandler = @import("file.zig").FileHandler;
 const handler = @import("rmt/handler.zig");
 const auth = @import("rmt/auth.zig");
+const debug_session = @import("debug_session.zig");
 
 const usage =
     \\usage: rmtbuild <command>                         sync files to the server, then run <command> there
@@ -107,6 +108,9 @@ fn serve(init: std.process.Init, defaults: config.Config, args: []const [:0]cons
 
     var server = handler.RmtServer.init(init.gpa, io, &files, load_key(init));
     server.max_payload = defaults.max_payload_mb * 1024 * 1024;
+    server.rider_agent = try dupe_env(init.arena.allocator(), init.environ_map, debug_session.rider_agent_env);
+    server.msvsmon_agent = try dupe_env(init.arena.allocator(), init.environ_map, debug_session.msvsmon_env);
+    server.mdbg_agent = try dupe_env(init.arena.allocator(), init.environ_map, debug_session.mdbg_env);
 
     handler.stop_commands_on_exit();
     std.log.info("serving on {s}:{d}", .{ listen, port });
@@ -133,12 +137,12 @@ fn run_command(init: std.process.Init, cfg: config.Config, name: []const u8) !u8
 
     // Before syncing, so a local port that's already taken fails straight away.
     const command = cfg.commands.get(name).?;
-    for (command.forward) |fwd| {
-        _ = rmt.forward(fwd) catch |err| switch (err) {
-            error.AddressInUse => fatal("localhost:{d} is already in use, forward another port with e.g. 'forward: {d}:{d}'", .{ fwd.local, fwd.local +| 1, fwd.remote }),
-            else => fatal("can't forward localhost:{d}: {s}", .{ fwd.local, @errorName(err) }),
-        };
-    }
+    for (command.forward) |fwd| try forward_or_die(&rmt, fwd, .command);
+    var debug_local: ?u16 = null;
+    if (command.debug) |dbg| if (dbg.client_forward()) |fwd| {
+        try forward_or_die(&rmt, fwd, .debug);
+        debug_local = fwd.local;
+    };
 
     const stats = rmt.sync(&files) catch |err| switch (err) {
         error.AuthRejected => fatal("{s}:{d} rejected our key, both sides need the same key", .{ cfg.address, cfg.port }),
@@ -149,11 +153,17 @@ fn run_command(init: std.process.Init, cfg: config.Config, name: []const u8) !u8
     for (command.forward) |fwd| {
         std.debug.print("rmtbuild: forwarding http://localhost:{d} -> server port {d}\n", .{ fwd.local, fwd.remote });
     }
+    if (debug_local) |local| if (command.debug) |dbg| if (dbg.port) |remote| {
+        std.debug.print("rmtbuild: forwarding debugger localhost:{d} -> server port {d}\n", .{ local, remote });
+    };
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
 
-    const result = rmt.run(name, &stdout_writer.interface) catch |err| switch (err) {
+    const result = rmt.run(name, &stdout_writer.interface, .{
+        .debug_local = debug_local,
+        .stdin = if (command.debug) |dbg| if (dbg.mode == .mdbg) std.Io.File.stdin() else null else null,
+    }) catch |err| switch (err) {
         error.EndOfStream => fatal("lost the connection to the server while '{s}' was running", .{name}),
         else => fatal("running '{s}' failed: {s}", .{ name, @errorName(err) }),
     };
@@ -183,8 +193,30 @@ fn print_usage(cfg: ?config.Config) void {
     while (it.next()) |entry| {
         // First line of the script is enough to recognise it.
         const first = std.mem.sliceTo(entry.value_ptr.run, '\n');
-        std.debug.print("  {s: <12} {s}\n", .{ entry.key_ptr.*, first });
+        if (entry.value_ptr.debug) |dbg| {
+            std.debug.print("  {s: <12} {s}  [debug:{s}]\n", .{ entry.key_ptr.*, first, @tagName(dbg.mode) });
+        } else {
+            std.debug.print("  {s: <12} {s}\n", .{ entry.key_ptr.*, first });
+        }
     }
+}
+
+fn dupe_env(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, key: []const u8) !?[]const u8 {
+    const value = environ.get(key) orelse return null;
+    if (value.len == 0) return null;
+    return try allocator.dupe(u8, value);
+}
+
+const ForwardKind = enum { command, debug };
+
+fn forward_or_die(rmt: *handler.RmtHandler, fwd: config.Forward, kind: ForwardKind) !void {
+    _ = rmt.forward(fwd) catch |err| switch (err) {
+        error.AddressInUse => switch (kind) {
+            .command => fatal("localhost:{d} is already in use, forward another port with e.g. 'forward: {d}:{d}'", .{ fwd.local, fwd.local +| 1, fwd.remote }),
+            .debug => fatal("localhost:{d} is already in use for the debugger. Set debug.local to a free port (it is forwarded to the server's {d}).", .{ fwd.local, fwd.remote }),
+        },
+        else => fatal("can't forward localhost:{d}: {s}", .{ fwd.local, @errorName(err) }),
+    };
 }
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
@@ -194,6 +226,7 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 
 test {
     _ = @import("config.zig");
+    _ = @import("debug_session.zig");
     _ = @import("file.zig");
     _ = @import("process.zig");
     _ = @import("rmt/pack.zig");

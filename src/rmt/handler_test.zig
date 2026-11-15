@@ -421,7 +421,7 @@ const RunCapture = struct {
 };
 
 fn runRmtRun(rmt: *RmtHandler, name: []const u8, capture: *RunCapture) void {
-    capture.result = rmt.run(name, &capture.out.writer) catch |err| {
+    capture.result = rmt.run(name, &capture.out.writer, .{}) catch |err| {
         capture.err = err;
         return;
     };
@@ -773,4 +773,422 @@ test "RUN stops the whole command when the client disconnects" {
 
     const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
     try std.testing.expect(elapsed < 10_000);
+}
+
+fn write_executable(dir: std.Io.Dir, io: std.Io, path: []const u8, contents: []const u8) !void {
+    try dir.writeFile(io, .{ .sub_path = path, .data = contents });
+    if (is_windows) return;
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o755));
+}
+
+fn runRmtRunOpts(rmt: *RmtHandler, name: []const u8, capture: *RunCapture, options: handler.RunOptions) void {
+    capture.result = rmt.run(name, &capture.out.writer, options) catch |err| {
+        capture.err = err;
+        return;
+    };
+}
+
+fn serveRunOpts(fx: *ServerFixture, name: []const u8, capture: *RunCapture, options: handler.RunOptions) !void {
+    var server_err: ?anyerror = null;
+    const server_thread = try std.Thread.spawn(.{}, runServerOnce, .{ &fx.server, &fx.listen, &server_err });
+    const client_thread = try std.Thread.spawn(.{}, runRmtRunOpts, .{ &fx.rmt, name, capture, options });
+    client_thread.join();
+    server_thread.join();
+    if (server_err) |e| return e;
+    if (capture.err) |e| return e;
+}
+
+test "Server debug rider agent" {
+    const io = std.testing.io;
+    var fx: ServerFixture = undefined;
+    try fx.init(".zig-cache/debug_rider_test", 8130);
+    defer fx.deinit();
+
+    const port: u16 = 18340;
+    if (is_windows) {
+        try write_executable(fx.repo.dir, io, "fake-agent.cmd",
+            \\@echo off
+            \\echo Login: rideruser
+            \\echo Password: s3cret
+            \\echo Port: 18340
+            \\powershell -NoProfile -Command "$l=New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Parse('127.0.0.1'),18340); $l.Start(); try { while($true){ $c=$l.AcceptTcpClient(); $c.Close() } } finally { $l.Stop() }"
+            \\
+        );
+    } else {
+        try write_executable(fx.repo.dir, io, "fake-agent.py",
+            \\#!/usr/bin/env python3
+            \\import os, socket, sys
+            \\port = 18340
+            \\for arg in sys.argv[1:]:
+            \\    if arg.startswith("-port="):
+            \\        port = int(arg.split("=", 1)[1])
+            \\print("Please, use these credentials to establish SSH connection", flush=True)
+            \\print("Login: rideruser", flush=True)
+            \\print("Password: s3cret", flush=True)
+            \\print(f"Port: {port}", flush=True)
+            \\open("agent.pid", "w").write(str(os.getpid()))
+            \\s = socket.socket()
+            \\s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            \\s.bind(("127.0.0.1", port))
+            \\s.listen(8)
+            \\while True:
+            \\    c, _ = s.accept()
+            \\    c.close()
+            \\
+        );
+    }
+
+    const agent = if (is_windows) ".\\fake-agent.cmd" else "./fake-agent.py";
+    const yaml = try std.fmt.allocPrint(std.testing.allocator,
+        \\commands:
+        \\  app:
+        \\    run: echo hello-from-app
+        \\    debug:
+        \\      mode: rider
+        \\      port: {d}
+        \\      agent: {s}
+        \\      allow_cleartext_password: true
+        \\
+    , .{ port, agent });
+    defer std.testing.allocator.free(yaml);
+    _ = try fx.file.create_file("rmtbuild.yaml", yaml);
+
+    var notices: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notices.items) |item| std.testing.allocator.free(item);
+        notices.deinit(std.testing.allocator);
+    }
+
+    var capture = RunCapture.init();
+    defer capture.deinit();
+    try serveRunOpts(&fx, "app", &capture, .{ .notices = &notices, .debug_local = 7000 });
+
+    try std.testing.expectEqual(handler.RunResult{ .exited = 0 }, capture.result.?);
+    try std.testing.expect(std.mem.indexOf(u8, capture.out.written(), "hello-from-app") != null);
+    try std.testing.expectEqual(@as(usize, 1), notices.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "mode=rider\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "login=rideruser\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "password=s3cret\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "started=1\n") != null);
+
+    // The helper is killed when the command ends.
+    if (!is_windows) {
+        var pid_buf: [32]u8 = undefined;
+        const pid_text = std.mem.trim(u8, try fx.repo.dir.readFile(io, "agent.pid", &pid_buf), " \r\n");
+        const pid = try std.fmt.parseInt(std.posix.pid_t, pid_text, 10);
+        try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
+    }
+}
+
+test "Server debug mdbg stdin" {
+    const io = std.testing.io;
+    var fx: ServerFixture = undefined;
+    try fx.init(".zig-cache/debug_mdbg_test", 8131);
+    defer fx.deinit();
+
+    if (is_windows) {
+        try write_executable(fx.repo.dir, io, "fake-mdbg.cmd",
+            \\@echo off
+            \\echo err 1>&2
+            \\powershell -NoProfile -Command "while ($null -ne ($l = [Console]::In.ReadLine())) { Write-Output ('line:' + $l) }; Write-Output eof"
+            \\
+        );
+    } else {
+        try write_executable(fx.repo.dir, io, "fake-mdbg.sh",
+            \\#!/bin/sh
+            \\echo err >&2
+            \\while IFS= read -r line; do
+            \\  printf 'line:%s\n' "$line"
+            \\done
+            \\printf 'eof\n'
+            \\
+        );
+    }
+
+    // On Windows the agent is the cmd script. On POSIX, `sh fake-mdbg.sh`.
+    const yaml = if (is_windows)
+        \\commands:
+        \\  app:
+        \\    run: echo built
+        \\    debug:
+        \\      mode: mdbg
+        \\      agent: .\fake-mdbg.cmd
+        \\      program: ignored
+        \\
+    else
+        \\commands:
+        \\  app:
+        \\    run: echo built
+        \\    debug:
+        \\      mode: mdbg
+        \\      agent: /bin/sh
+        \\      program: fake-mdbg.sh
+        \\
+    ;
+    _ = try fx.file.create_file("rmtbuild.yaml", yaml);
+
+    try fx.repo.dir.writeFile(io, .{ .sub_path = "stdin.txt", .data = "ping\n" });
+    const stdin = try fx.repo.dir.openFile(io, "stdin.txt", .{});
+    defer stdin.close(io);
+
+    var notices: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notices.items) |item| std.testing.allocator.free(item);
+        notices.deinit(std.testing.allocator);
+    }
+
+    var capture = RunCapture.init();
+    defer capture.deinit();
+    try serveRunOpts(&fx, "app", &capture, .{
+        .notices = &notices,
+        .stdin = stdin,
+        .join_stdin = true,
+    });
+
+    try std.testing.expectEqual(handler.RunResult{ .exited = 0 }, capture.result.?);
+    const out = capture.out.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "built") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "line:ping") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "eof") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "err") != null);
+    try std.testing.expectEqual(@as(usize, 1), notices.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "mode=mdbg\n") != null);
+}
+
+test "rider password stays off the wire unless opted in" {
+    const io = std.testing.io;
+    var fx: ServerFixture = undefined;
+    try fx.init(".zig-cache/debug_pw_test", 8132);
+    defer fx.deinit();
+
+    const port: u16 = 18342;
+    const agent = if (is_windows) ".\\fake-agent.cmd" else "./fake-agent.py";
+    if (is_windows) {
+        try write_executable(fx.repo.dir, io, "fake-agent.cmd",
+            \\@echo off
+            \\echo Login: rideruser
+            \\echo Password: s3cret
+            \\echo Port: 18342
+            \\powershell -NoProfile -Command "$l=New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Parse('127.0.0.1'),18342); $l.Start(); try { while($true){ $c=$l.AcceptTcpClient(); $c.Close() } } finally { $l.Stop() }"
+            \\
+        );
+    } else {
+        try write_executable(fx.repo.dir, io, "fake-agent.py",
+            \\#!/usr/bin/env python3
+            \\import socket, sys
+            \\port = 18342
+            \\for arg in sys.argv[1:]:
+            \\    if arg.startswith("-port="):
+            \\        port = int(arg.split("=", 1)[1])
+            \\print("Login: rideruser", flush=True)
+            \\print("Password: s3cret", flush=True)
+            \\print(f"Port: {port}", flush=True)
+            \\s = socket.socket()
+            \\s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            \\s.bind(("127.0.0.1", port))
+            \\s.listen(8)
+            \\while True:
+            \\    c, _ = s.accept()
+            \\    c.close()
+            \\
+        );
+    }
+
+    const yaml = try std.fmt.allocPrint(std.testing.allocator,
+        \\commands:
+        \\  app:
+        \\    run: echo hi
+        \\    debug:
+        \\      mode: rider
+        \\      port: {d}
+        \\      agent: {s}
+        \\
+    , .{ port, agent });
+    defer std.testing.allocator.free(yaml);
+    _ = try fx.file.create_file("rmtbuild.yaml", yaml);
+
+    var notices: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notices.items) |item| std.testing.allocator.free(item);
+        notices.deinit(std.testing.allocator);
+    }
+    var capture = RunCapture.init();
+    defer capture.deinit();
+    try serveRunOpts(&fx, "app", &capture, .{ .notices = &notices });
+
+    try std.testing.expectEqual(handler.RunResult{ .exited = 0 }, capture.result.?);
+    try std.testing.expectEqual(@as(usize, 1), notices.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "\npassword=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "s3cret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "cleartext_password=0\n") != null);
+}
+
+test "debug refuses a port that is already open" {
+    const io = std.testing.io;
+    var fx: ServerFixture = undefined;
+    try fx.init(".zig-cache/debug_busy_test", 8133);
+    defer fx.deinit();
+
+    const port: u16 = 18343;
+    const addr = try net.IpAddress.parse("127.0.0.1", port);
+    var busy = try addr.listen(io, .{ .mode = .stream, .protocol = .tcp, .reuse_address = true });
+    defer busy.deinit(io);
+
+    const agent = if (is_windows) ".\\no-such-agent.cmd" else "./no-such-agent";
+    const yaml = try std.fmt.allocPrint(std.testing.allocator,
+        \\commands:
+        \\  app:
+        \\    run: echo hi
+        \\    debug:
+        \\      mode: msvsmon
+        \\      port: {d}
+        \\      agent: {s}
+        \\
+    , .{ port, agent });
+    defer std.testing.allocator.free(yaml);
+    _ = try fx.file.create_file("rmtbuild.yaml", yaml);
+
+    var capture = RunCapture.init();
+    defer capture.deinit();
+    try serveRunOpts(&fx, "app", &capture, .{});
+    const message = capture.result.?.failed;
+    try std.testing.expect(std.mem.indexOf(u8, message, "already listening") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, agent) != null);
+}
+
+test "debug failure names the env agent path" {
+    const io = std.testing.io;
+    var fx: ServerFixture = undefined;
+    try fx.init(".zig-cache/debug_env_test", 8134);
+    defer fx.deinit();
+
+    if (is_windows) {
+        try write_executable(fx.repo.dir, io, "exit-agent.cmd",
+            \\@echo off
+            \\exit /b 1
+            \\
+        );
+        fx.server.msvsmon_agent = ".\\exit-agent.cmd";
+    } else {
+        try write_executable(fx.repo.dir, io, "exit-agent.sh",
+            \\#!/bin/sh
+            \\exit 1
+            \\
+        );
+        fx.server.msvsmon_agent = "./exit-agent.sh";
+    }
+
+    _ = try fx.file.create_file("rmtbuild.yaml",
+        \\commands:
+        \\  app:
+        \\    run: echo hi
+        \\    debug:
+        \\      mode: msvsmon
+        \\      port: 18344
+        \\
+    );
+
+    var capture = RunCapture.init();
+    defer capture.deinit();
+    try serveRunOpts(&fx, "app", &capture, .{});
+    const message = capture.result.?.failed;
+    try std.testing.expect(std.mem.indexOf(u8, message, fx.server.msvsmon_agent.?) != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "RMTBUILD_MSVSMON") != null);
+}
+
+fn flood_stdin(io: std.Io, stream: net.Stream) void {
+    // More than a typical pipe buffer, framed the way the mdbg client sends stdin.
+    var payload: [1024]u8 = undefined;
+    @memset(&payload, 'x');
+    var hdr: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hdr, payload.len, .little);
+    var wbuf: [64]u8 = undefined;
+    var writer = stream.writer(io, &wbuf);
+    for (0..256) |_| {
+        writer.interface.writeAll(&hdr) catch return;
+        writer.interface.writeAll(&payload) catch return;
+        writer.interface.flush() catch return;
+    }
+}
+
+test "mdbg tears down when stdin is not read" {
+    const io = std.testing.io;
+    var fx: ServerFixture = undefined;
+    try fx.init(".zig-cache/debug_stdin_block_test", 8135);
+    defer fx.deinit();
+
+    // Never reads stdin, and would outlive the client if the watcher wedged on the pipe.
+    _ = try fx.file.create_file("rmtbuild.yaml", if (is_windows)
+        \\commands:
+        \\  app:
+        \\    run: echo built
+        \\    debug:
+        \\      mode: mdbg
+        \\      agent: .\fake-mdbg.cmd
+        \\      program: ignored
+        \\
+    else
+        \\commands:
+        \\  app:
+        \\    run: echo built
+        \\    debug:
+        \\      mode: mdbg
+        \\      agent: /bin/sh
+        \\      program: fake-mdbg.sh
+        \\
+    );
+    if (is_windows) {
+        try write_executable(fx.repo.dir, io, "fake-mdbg.cmd",
+            \\@echo off
+            \\echo started
+            \\ping -n 30 127.0.0.1 >nul
+            \\
+        );
+    } else {
+        try write_executable(fx.repo.dir, io, "fake-mdbg.sh",
+            \\#!/bin/sh
+            \\echo started
+            \\sleep 30
+            \\
+        );
+    }
+
+    var server_err: ?anyerror = null;
+    const server_thread = try std.Thread.spawn(.{}, runServerOnce, .{ &fx.server, &fx.listen, &server_err });
+    const start = std.Io.Timestamp.now(io, .awake);
+
+    {
+        const addr = try net.IpAddress.parse("127.0.0.1", 8135);
+        const stream = try addr.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        try auth.client_handshake(io, &test_key, stream);
+
+        var packet: Packet = .{ .magic = 0xAF, .token = 1, .command = @intFromEnum(RmtCommands.RMT_RUN) };
+        try wire.append_payload_len(&packet, "app".len);
+        try wire.write_packet(io, packet, stream);
+        try wire.write_payload(io, "app", stream);
+
+        var rbuf: [512]u8 = undefined;
+        var reader = stream.reader(io, &rbuf);
+        // Build output, then the mdbg notice, then "started".
+        var saw_started = false;
+        while (!saw_started) {
+            const reply = try wire.read_packet(&reader.interface);
+            const payload = try wire.read_payload(std.testing.allocator, reply, &reader.interface);
+            defer payload.deinit();
+            if (std.mem.indexOf(u8, payload.bytes, "started") != null) saw_started = true;
+        }
+
+        const flood = try std.Thread.spawn(.{}, flood_stdin, .{ io, stream });
+        io.sleep(.fromMilliseconds(200), .awake) catch {};
+        stream.shutdown(io, .both) catch {};
+        flood.join();
+    }
+
+    server_thread.join();
+    if (server_err) |e| return e;
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+    try std.testing.expect(elapsed < 8_000);
 }

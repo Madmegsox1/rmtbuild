@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const net = @import("std").Io.net;
 const Packet = @import("pack.zig").Packet;
 const RunKind = @import("pack.zig").RunKind;
@@ -9,6 +10,7 @@ const wire = @import("wire.zig");
 const auth = @import("auth.zig");
 const forward = @import("forward.zig");
 const process = @import("../process.zig");
+const debug_session = @import("../debug_session.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const RmtInfo = struct {
@@ -39,6 +41,50 @@ pub const RunResult = union(enum) {
     signal: u32,
     /// The server couldn't run the command. Message is owned by the handler's allocator.
     failed: []u8,
+};
+
+pub const RunOptions = struct {
+    /// Client port the debug listen port was forwarded to. Used in the notice banner.
+    debug_local: ?u16 = null,
+    /// Copied to the remote process once an `mdbg` notice arrives.
+    stdin: ?std.Io.File = null,
+    /// Wait for the stdin copy to finish. Tests set this; a terminal stdin would block it.
+    join_stdin: bool = false,
+    /// When set, debug notices are appended here (caller frees each) instead of printed.
+    notices: ?*std.ArrayList([]u8) = null,
+};
+
+const StdinPump = struct {
+    io: std.Io,
+    stdin: std.Io.File,
+    stream: net.Stream,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *StdinPump) void {
+        var rbuf: [1024]u8 = undefined;
+        var reader = self.stdin.reader(self.io, &rbuf);
+        var tmp: [1024]u8 = undefined;
+        while (!self.done.load(.acquire)) {
+            const n = reader.interface.readSliceShort(&tmp) catch break;
+            if (n == 0) break;
+            if (self.done.load(.acquire)) break;
+            if (!self.write_frame(tmp[0..n])) return;
+        }
+        // Length 0 tells the server to close the debugger's stdin. Socket EOF stays
+        // "the client went away", which still kills the command.
+        _ = self.write_frame(&.{});
+    }
+
+    fn write_frame(self: *StdinPump, data: []const u8) bool {
+        var hdr: [4]u8 = undefined;
+        std.mem.writeInt(u32, &hdr, @intCast(data.len), .little);
+        var wbuf: [256]u8 = undefined;
+        var writer = self.stream.writer(self.io, &wbuf);
+        writer.interface.writeAll(&hdr) catch return false;
+        if (data.len != 0) writer.interface.writeAll(data) catch return false;
+        writer.interface.flush() catch return false;
+        return true;
+    }
 };
 
 pub const LsResult = struct {
@@ -276,7 +322,7 @@ pub const RmtHandler = struct {
     }
 
     /// Runs the configured command `name` on the server, writing its output to `out` as it arrives.
-    pub fn run(self: *Self, name: []const u8, out: *std.Io.Writer) !RunResult {
+    pub fn run(self: *Self, name: []const u8, out: *std.Io.Writer, options: RunOptions) !RunResult {
         var packet = try self.init_packet(.RMT_RUN);
         try wire.append_payload_len(&packet, name.len);
 
@@ -285,6 +331,19 @@ pub const RmtHandler = struct {
 
         try pipe_packet(self, packet, stream);
         try pipe_payload(self, name, stream);
+
+        // Started only after an mdbg notice, so these bytes can't land in the request payload.
+        var pump: ?*StdinPump = null;
+        var pump_thread: ?std.Thread = null;
+        defer if (pump) |started| {
+            started.done.store(true, .release);
+            if (options.join_stdin) {
+                if (pump_thread) |thread| thread.join();
+                self.allocator.destroy(started);
+            } else if (pump_thread) |thread| {
+                thread.detach();
+            } else self.allocator.destroy(started);
+        };
 
         var rbuff: [4096]u8 = undefined;
         var reader = stream.reader(self.io, &rbuff);
@@ -300,6 +359,27 @@ pub const RmtHandler = struct {
                     defer payload.deinit();
                     try out.writeAll(payload.bytes);
                     try out.flush();
+                },
+                .notice => {
+                    defer payload.deinit();
+                    if (options.notices) |list| {
+                        try list.append(self.allocator, try self.allocator.dupe(u8, payload.bytes));
+                    } else {
+                        debug_session.print_notice(payload.bytes, options.debug_local);
+                    }
+                    if (options.stdin) |stdin| {
+                        const mode = debug_session.notice_value(payload.bytes, "mode") orelse "";
+                        if (pump == null and std.mem.eql(u8, mode, "mdbg")) {
+                            const started = try self.allocator.create(StdinPump);
+                            started.* = .{ .io = self.io, .stdin = stdin, .stream = stream };
+                            pump = started;
+                            pump_thread = std.Thread.spawn(.{}, StdinPump.run, .{started}) catch |err| {
+                                self.allocator.destroy(started);
+                                pump = null;
+                                return err;
+                            };
+                        }
+                    }
                 },
                 .exit => {
                     payload.deinit();
@@ -417,6 +497,10 @@ pub const RmtServer = struct {
     max_payload: u32 = default_max_payload,
     /// Connections run on their own threads, file changes and config reads go one at a time.
     files_lock: std.Io.Mutex = .init,
+    /// `RMTBUILD_RIDER_AGENT` / `RMTBUILD_MSVSMON` / `RMTBUILD_MDBG`, copied at startup.
+    rider_agent: ?[]const u8 = null,
+    msvsmon_agent: ?[]const u8 = null,
+    mdbg_agent: ?[]const u8 = null,
 
     pub const default_max_payload = 256 * 1024 * 1024;
 
@@ -534,6 +618,7 @@ pub const RmtServer = struct {
 
     /// Looks `name` up in the server's own (synced) rmtbuild.yaml, so only configured commands run.
     /// Streams output packets, then ends with exit / signal / failed.
+    /// A `debug` block starts the helper (Rider agent, msvsmon, or MDbg) around that script.
     fn handle_run(self: *Self, request: Packet, name: []const u8, stream: net.Stream) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -554,13 +639,40 @@ pub const RmtServer = struct {
         const command = cfg.commands.get(name) orelse
             return self.run_failed(request, stream, "unknown command '{s}' in server's " ++ config.file_name, .{name});
 
-        var running = process.spawn(self.io, self.allocator, self.file_handler.root, self.file_handler.child_cwd(), command.run) catch |err|
+        const debug_cfg = command.debug;
+        const mdbg = if (debug_cfg) |dbg| dbg.mode == .mdbg else false;
+
+        var listener: ?*debug_session.Listener = null;
+        defer if (listener) |helper| helper.deinit();
+
+        var script = command.run;
+        if (debug_cfg) |dbg| if (dbg.mode != .mdbg) {
+            const ready = try self.prepare_listener(alloc, dbg, request, stream, &listener);
+            if (!ready) return;
+            script = try debug_session.with_wait_env(alloc, builtin.os.tag, command.run);
+        };
+
+        const pending = try self.allocator.alloc(u8, if (mdbg) 64 * 1024 else 0);
+        defer self.allocator.free(pending);
+
+        // Deinited after the watcher is joined (that defer is registered below), so a
+        // disconnect during MDbg still has a live process to kill.
+        var debugging: ?process.Running = null;
+        defer if (debugging) |*dbg_proc| dbg_proc.deinit();
+
+        var running = process.spawn(self.io, self.allocator, self.file_handler.root, self.file_handler.child_cwd(), script) catch |err|
             return self.run_failed(request, stream, "failed to start '{s}': {s}", .{ name, @errorName(err) });
         defer running.deinit();
 
         // Long running commands (servers) may print nothing for ages, so a dropped client is
         // noticed by watching the connection rather than by the next failed write.
-        var watch: RunWatch = .{ .io = self.io, .stream = stream, .running = &running };
+        var watch: RunWatch = .{
+            .io = self.io,
+            .stream = stream,
+            .running = &running,
+            .pending = pending,
+            .buffer_stdin = mdbg,
+        };
         const watcher = try std.Thread.spawn(.{}, RunWatch.run, .{&watch});
         defer {
             watch.finished.store(true, .release);
@@ -569,6 +681,181 @@ pub const RmtServer = struct {
             watcher.join();
         }
 
+        const first = try self.pump_output(request, stream, &running, &watch);
+        if (first.client_gone) {
+            std.log.info("rmt: client disconnected, stopped '{s}'", .{name});
+            return;
+        }
+
+        if (debug_cfg) |dbg| if (dbg.mode == .mdbg) {
+            const build_ok = switch (first.exit) {
+                .exited => |code| code == 0,
+                else => false,
+            };
+            if (!build_ok) return self.send_term(request, stream, name, first.exit);
+
+            const agent = debug_session.resolve_agent(builtin.os.tag, .mdbg, dbg.agent, self.mdbg_agent);
+            const argv = try debug_session.mdbg_argv(alloc, builtin.os.tag, agent, dbg.program.?, dbg.args);
+            debugging = process.spawn_merged_argv(self.io, self.allocator, self.file_handler.child_cwd(), argv, .{ .stdin = .pipe }) catch |err|
+                return self.run_failed(request, stream, "failed to start '{s}' ({s}): {s}", .{ agent, debug_session.env_name(.mdbg), @errorName(err) });
+            const dbg_proc = &debugging.?;
+
+            const stdin = dbg_proc.input() orelse return self.run_failed(request, stream, "failed to start '{s}': no stdin pipe", .{agent});
+            try watch.arm_stdin(self.allocator, dbg_proc, stdin);
+
+            const notice = try debug_session.format_notice(alloc, .{ .mode = .mdbg });
+            try self.send_notice(request, stream, notice);
+
+            const second = try self.pump_output(request, stream, dbg_proc, &watch);
+            if (second.client_gone) {
+                std.log.info("rmt: client disconnected, stopped '{s}'", .{name});
+                return;
+            }
+            return self.send_term(request, stream, name, second.exit);
+        };
+
+        return self.send_term(request, stream, name, first.exit);
+    }
+
+    /// Starts the listen-mode helper when `debug.start` is set, then waits until its port accepts
+    /// connections and tells the client. Returns false when a failure packet was already sent.
+    fn prepare_listener(
+        self: *Self,
+        alloc: std.mem.Allocator,
+        dbg: config.Debug,
+        request: Packet,
+        stream: net.Stream,
+        listener: *?*debug_session.Listener,
+    ) !bool {
+        const port = dbg.port.?;
+        var creds: ?debug_session.Credentials = null;
+        const agent = debug_session.resolve_agent(builtin.os.tag, dbg.mode, dbg.agent, switch (dbg.mode) {
+            .rider => self.rider_agent,
+            .msvsmon => self.msvsmon_agent,
+            .mdbg => self.mdbg_agent,
+        });
+
+        if (dbg.start) {
+            // A listener that is already up is not msvsmon (or the agent). Attaching the
+            // client to it would debug whatever else bound the port.
+            if (debug_session.port_open(self.io, port)) {
+                try self.debug_start_failed(request, stream, dbg, agent, error.PortInUse, null);
+                return false;
+            }
+            const argv = try debug_session.listener_argv(alloc, builtin.os.tag, dbg.mode, agent, port);
+            const helper = debug_session.Listener.spawn(self.allocator, self.io, self.file_handler.child_cwd(), argv) catch |err| {
+                try self.debug_start_failed(request, stream, dbg, agent, err, null);
+                return false;
+            };
+            listener.* = helper;
+
+            if (dbg.mode == .rider) {
+                creds = helper.wait_credentials(port) catch |err| {
+                    try self.debug_start_failed(request, stream, dbg, agent, err, helper);
+                    return false;
+                };
+            }
+        }
+
+        {
+            const start = std.Io.Timestamp.now(self.io, .awake);
+            while (true) {
+                if (debug_session.port_open(self.io, port)) break;
+                if (listener.*) |helper| if (helper.stdio_ended()) {
+                    try self.debug_start_failed(request, stream, dbg, agent, error.AgentExited, helper);
+                    return false;
+                };
+                const elapsed = start.durationTo(std.Io.Timestamp.now(self.io, .awake)).toMilliseconds();
+                if (elapsed > debug_session.ready_timeout_ms) {
+                    try self.debug_start_failed(request, stream, dbg, agent, error.DebugPortClosed, listener.*);
+                    return false;
+                }
+                self.io.sleep(.fromMilliseconds(50), .awake) catch {
+                    try self.debug_start_failed(request, stream, dbg, agent, error.DebugPortClosed, listener.*);
+                    return false;
+                };
+            }
+            if (listener.*) |helper| if (helper.stdio_ended()) {
+                try self.debug_start_failed(request, stream, dbg, agent, error.AgentExited, helper);
+                return false;
+            };
+        }
+
+        if (dbg.mode == .msvsmon) {
+            std.log.warn("msvsmon /noauth is on localhost only. Any local user on this machine can attach and run code as the rmtbuild user. The forwarded port exposes that to the client. Do not open the port in the firewall.", .{});
+        }
+        const send_password = dbg.mode == .rider and dbg.start and dbg.allow_cleartext_password;
+        if (dbg.mode == .rider and dbg.start) if (creds) |c| {
+            if (send_password) {
+                std.log.warn("sending the JetBrains agent password in cleartext on the unencrypted rmtbuild connection. The agent listens on every interface; firewall that port so only localhost can reach it. user={s} password={s}", .{ c.login, c.password });
+            } else {
+                std.log.warn("JetBrains agent password was NOT sent to the client (the rmtbuild connection is not encrypted, and the agent listens on every interface). Firewall that port. user={s} password={s}. Set debug.allow_cleartext_password: true to send the password anyway.", .{ c.login, c.password });
+            }
+        };
+
+        const notice = try debug_session.format_notice(alloc, .{
+            .mode = dbg.mode,
+            .started = dbg.start,
+            .port = port,
+            .login = if (creds) |c| c.login else null,
+            .password = if (creds) |c| c.password else null,
+            .cleartext_password = send_password,
+        });
+        try self.send_notice(request, stream, notice);
+        return true;
+    }
+
+    fn debug_start_failed(
+        self: *Self,
+        request: Packet,
+        stream: net.Stream,
+        dbg: config.Debug,
+        agent: []const u8,
+        err: anyerror,
+        listener: ?*debug_session.Listener,
+    ) !void {
+        const captured = if (listener) |helper| helper.copy_output(self.allocator) catch "" else "";
+        defer if (captured.len != 0) self.allocator.free(captured);
+
+        const detail = switch (err) {
+            error.FileNotFound => "not found",
+            error.AgentTimeout => "timed out waiting for it to print credentials",
+            error.AgentExited => "exited before it was ready",
+            error.PortMismatch => "listened on a different port than requested",
+            error.DebugPortClosed => "nothing accepted a connection on its port",
+            error.PortInUse => "something is already listening on that port, so it is not the debugger we would start",
+            else => @errorName(err),
+        };
+        const where = if (!dbg.start) "already-running debugger" else agent;
+        const windows_note = if (builtin.os.tag != .windows and dbg.mode != .rider)
+            " msvsmon and MDbg debug .NET Framework on Windows."
+        else
+            "";
+        const message = try std.fmt.allocPrint(self.allocator, "can't use {s} debugger '{s}' ({s}): {s}.{s}{s}{s}", .{
+            @tagName(dbg.mode),
+            where,
+            debug_session.env_name(dbg.mode),
+            detail,
+            windows_note,
+            if (captured.len == 0) "" else "\n",
+            captured,
+        });
+        defer self.allocator.free(message);
+        return self.run_failed_private(request, stream, message);
+    }
+
+    const Pumped = struct {
+        exit: process.Exit,
+        client_gone: bool,
+    };
+
+    fn pump_output(
+        self: *Self,
+        request: Packet,
+        stream: net.Stream,
+        running: *process.Running,
+        watch: *RunWatch,
+    ) !Pumped {
         var client_gone = false;
         var buf: [4096]u8 = undefined;
         while (true) {
@@ -587,12 +874,11 @@ pub const RmtServer = struct {
         }
 
         const exit = try running.wait();
-        watch.finished.store(true, .release);
-        if (client_gone or watch.disconnected.load(.acquire)) {
-            std.log.info("rmt: client disconnected, stopped '{s}'", .{name});
-            return;
-        }
+        const gone = client_gone or watch.disconnected.load(.acquire);
+        return .{ .exit = exit, .client_gone = gone };
+    }
 
+    fn send_term(self: *Self, request: Packet, stream: net.Stream, name: []const u8, exit: process.Exit) !void {
         var packet = wire.reply_packet(request);
         packet.args = switch (exit) {
             .exited => |code| .{ .run = .{ .kind = .exit, .code = code } },
@@ -600,6 +886,14 @@ pub const RmtServer = struct {
             .unknown => |status| return self.run_failed(request, stream, "'{s}' ended with unknown status {d}", .{ name, status }),
         };
         try wire.write_packet(self.io, packet, stream);
+    }
+
+    fn send_notice(self: *Self, request: Packet, stream: net.Stream, text: []const u8) !void {
+        var packet = wire.reply_packet(request);
+        packet.args = .{ .run = .{ .kind = .notice } };
+        try wire.append_payload_len(&packet, text.len);
+        try wire.write_packet(self.io, packet, stream);
+        try wire.write_payload(self.io, text, stream);
     }
 
     fn send_output(self: *Self, request: Packet, data: []const u8, stream: net.Stream) !void {
@@ -632,7 +926,16 @@ pub const RmtServer = struct {
         const message = try std.fmt.allocPrint(self.allocator, fmt, args);
         defer self.allocator.free(message);
         std.log.info("rmt: run: {s}", .{message});
+        return self.write_failed(request, stream, message);
+    }
 
+    /// `message` may contain debugger credentials, so it is sent to the client and not logged.
+    fn run_failed_private(self: *Self, request: Packet, stream: net.Stream, message: []const u8) !void {
+        std.log.info("rmt: run: debug helper failed", .{});
+        return self.write_failed(request, stream, message);
+    }
+
+    fn write_failed(self: *Self, request: Packet, stream: net.Stream, message: []const u8) !void {
         var packet = wire.reply_packet(request);
         packet.args = .{ .run = .{ .kind = .failed } };
         try wire.append_payload_len(&packet, message.len);
@@ -697,44 +1000,235 @@ pub const RmtServer = struct {
     }
 };
 
-/// Watches a RUN connection: the client sends nothing after its request, so any end of stream
-/// means it went away, and the command is stopped.
+/// Watches a RUN connection. The client sends nothing after its request, except stdin bytes
+/// for an `mdbg` session, so an end of stream means it went away and the command is stopped.
 const RunWatch = struct {
     io: std.Io,
     stream: net.Stream,
-    running: *const process.Running,
+    running: *process.Running,
+    lock: std.Io.Mutex = .init,
+    /// Set while an mdbg process should receive client bytes.
+    stdin: ?std.Io.File = null,
+    /// A zero-length stdin frame arrived. Further bytes are dropped and the pipe is closed.
+    stdin_closed: bool = false,
+    pending: []u8 = &.{},
+    pending_len: usize = 0,
+    /// Buffer client bytes until `arm_stdin` instead of discarding them.
+    buffer_stdin: bool = false,
     finished: std.atomic.Value(bool) = .init(false),
     disconnected: std.atomic.Value(bool) = .init(false),
 
-    fn run(self: *RunWatch) void {
-        var buf: [64]u8 = undefined;
-        var reader = self.stream.reader(self.io, &buf);
+    fn point_at(self: *RunWatch, running: *process.Running) void {
+        self.lock.lockUncancelable(self.io);
+        self.running = running;
+        self.lock.unlock(self.io);
+    }
+
+    /// Points the watcher at `running` and flushes bytes buffered during the build.
+    /// Further client bytes are written straight to `file`.
+    fn arm_stdin(self: *RunWatch, allocator: std.mem.Allocator, running: *process.Running, file: std.Io.File) !void {
+        self.point_at(running);
         while (true) {
-            reader.interface.fillMore() catch break;
-            reader.interface.tossBuffered();
+            self.lock.lockUncancelable(self.io);
+            if (self.stdin_closed) {
+                self.stdin = null;
+                running.close_input();
+                self.lock.unlock(self.io);
+                return;
+            }
+            const n = self.pending_len;
+            if (n == 0) {
+                set_stdin_nonblock(file);
+                self.stdin = file;
+                self.lock.unlock(self.io);
+                return;
+            }
+            const copy = allocator.alloc(u8, n) catch {
+                self.lock.unlock(self.io);
+                return error.OutOfMemory;
+            };
+            @memcpy(copy, self.pending[0..n]);
+            self.pending_len = 0;
+            self.lock.unlock(self.io);
+            defer allocator.free(copy);
+            // Outside the lock, and non-blocking: a full pipe must not stall this thread.
+            if (write_stdin(file, copy) == .err) {
+                self.disconnected.store(true, .release);
+                running.stop();
+                return;
+            }
         }
+    }
+
+    fn close_child_stdin(self: *RunWatch) void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        self.stdin_closed = true;
+        self.stdin = null;
+        self.running.close_input();
+    }
+
+    fn current(self: *RunWatch) *process.Running {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        return self.running;
+    }
+
+    fn absorb(self: *RunWatch, data: []const u8) void {
+        self.lock.lockUncancelable(self.io);
+        if (self.stdin_closed) {
+            self.lock.unlock(self.io);
+            return;
+        }
+        const file = self.stdin;
+        if (file == null) {
+            if (self.buffer_stdin) {
+                const room = self.pending.len - self.pending_len;
+                if (data.len > room) {
+                    self.lock.unlock(self.io);
+                    self.disconnected.store(true, .release);
+                    self.current().stop();
+                    return;
+                }
+                @memcpy(self.pending[self.pending_len..][0..data.len], data);
+                self.pending_len += data.len;
+            }
+            self.lock.unlock(self.io);
+            return;
+        }
+        self.lock.unlock(self.io);
+        // A full stdin pipe must not block this thread. It is the thread that notices
+        // the client disconnect; a blocking write here wedges shutdown's join.
+        if (write_stdin(file.?, data) == .err) {
+            self.disconnected.store(true, .release);
+            self.current().stop();
+        }
+    }
+
+    fn run(self: *RunWatch) void {
+        if (self.buffer_stdin) self.run_framed() else self.run_discard();
         if (self.finished.load(.acquire)) return;
 
         self.disconnected.store(true, .release);
-        self.running.stop();
+        self.current().stop();
 
         // Give it a few seconds to shut down cleanly before forcing it.
         for (0..50) |_| {
             if (self.finished.load(.acquire)) return;
             self.io.sleep(.fromMilliseconds(100), .awake) catch return;
         }
-        self.running.kill();
+        self.current().kill();
+    }
+
+    /// Non-mdbg clients send nothing. Any bytes are ignored; EOF is the client leaving.
+    fn run_discard(self: *RunWatch) void {
+        var buf: [1024]u8 = undefined;
+        var reader = self.stream.reader(self.io, &buf);
+        while (true) {
+            reader.interface.fillMore() catch break;
+            reader.interface.tossBuffered();
+        }
+    }
+
+    /// mdbg stdin is length-prefixed. A length of 0 closes the child's stdin (Ctrl-D).
+    /// EOF on the socket is still the client disconnecting.
+    fn run_framed(self: *RunWatch) void {
+        var buf: [1024]u8 = undefined;
+        var reader = self.stream.reader(self.io, &buf);
+        var header: [4]u8 = undefined;
+        var header_got: usize = 0;
+        var need: ?usize = null;
+        while (true) {
+            reader.interface.fillMore() catch break;
+            const data = reader.interface.buffered();
+            var i: usize = 0;
+            while (i < data.len) {
+                if (need == null) {
+                    const take = @min(4 - header_got, data.len - i);
+                    @memcpy(header[header_got..][0..take], data[i..][0..take]);
+                    header_got += take;
+                    i += take;
+                    if (header_got < 4) continue;
+                    const len = std.mem.readInt(u32, &header, .little);
+                    header_got = 0;
+                    if (len == 0) {
+                        self.close_child_stdin();
+                    } else if (len > 1024 * 1024) {
+                        self.disconnected.store(true, .release);
+                        self.current().stop();
+                        reader.interface.toss(data.len);
+                        return;
+                    } else {
+                        need = len;
+                    }
+                } else {
+                    const left = need.?;
+                    const take = @min(left, data.len - i);
+                    self.absorb(data[i..][0..take]);
+                    i += take;
+                    if (take == left) need = null else need = left - take;
+                }
+            }
+            reader.interface.toss(data.len);
+        }
     }
 };
 
 /// Makes `rmtbuild serve` stop running commands before it exits.
 pub const stop_commands_on_exit = process.stop_all_on_exit;
 
-fn connect_localhost(io: std.Io, port: u16) !net.Stream {
-    // Servers often bind only one of the two loopback addresses.
-    const v4 = try net.IpAddress.parse("127.0.0.1", port);
-    return v4.connect(io, .{ .mode = .stream }) catch {
-        const v6 = try net.IpAddress.parse("::1", port);
-        return v6.connect(io, .{ .mode = .stream });
+const connect_localhost = debug_session.connect_localhost;
+
+const StdinWrite = enum { ok, blocked, err };
+
+/// Writes what fits. A full pipe returns `.blocked` instead of waiting.
+fn write_stdin(file: std.Io.File, data: []const u8) StdinWrite {
+    if (data.len == 0) return .ok;
+    if (comptime builtin.os.tag == .windows) {
+        var wrote: std.os.windows.DWORD = 0;
+        if (!win_write.WriteFile(file.handle, data.ptr, @intCast(@min(data.len, std.math.maxInt(u32))), &wrote, null).toBool()) {
+            const err = std.os.windows.GetLastError();
+            // PIPE_NOWAIT: the buffer is full, or the reader is gone.
+            if (err == .NO_DATA or err == .PIPE_BUSY) return .blocked;
+            return .err;
+        }
+        return .ok;
+    }
+    const rc = std.posix.system.write(file.handle, data.ptr, data.len);
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS => .ok,
+        .AGAIN => .blocked,
+        else => .err,
     };
 }
+
+fn set_stdin_nonblock(file: std.Io.File) void {
+    if (comptime builtin.os.tag == .windows) {
+        var mode: std.os.windows.DWORD = 1; // PIPE_NOWAIT
+        _ = win_write.SetNamedPipeHandleState(file.handle, &mode, null, null);
+        return;
+    }
+    const got = std.posix.system.fcntl(file.handle, std.posix.F.GETFL, 0);
+    if (std.posix.errno(got) != .SUCCESS) return;
+    const flags: usize = @intCast(got);
+    const nonblock: usize = 1 << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    _ = std.posix.system.fcntl(file.handle, std.posix.F.SETFL, flags | nonblock);
+}
+
+/// WriteFile / SetNamedPipeHandleState, used so a full MDbg stdin pipe does not block.
+const win_write = struct {
+    const windows = std.os.windows;
+    extern "kernel32" fn WriteFile(
+        handle: windows.HANDLE,
+        buf: [*]const u8,
+        len: windows.DWORD,
+        written: *windows.DWORD,
+        overlapped: ?*anyopaque,
+    ) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn SetNamedPipeHandleState(
+        handle: windows.HANDLE,
+        mode: ?*windows.DWORD,
+        max_collect: ?*windows.DWORD,
+        timeout: ?*windows.DWORD,
+    ) callconv(.winapi) windows.BOOL;
+};
