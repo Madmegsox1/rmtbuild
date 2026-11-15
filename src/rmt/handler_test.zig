@@ -849,6 +849,7 @@ test "Server debug rider agent" {
         \\      mode: rider
         \\      port: {d}
         \\      agent: {s}
+        \\      allow_cleartext_password: true
         \\
     , .{ port, agent });
     defer std.testing.allocator.free(yaml);
@@ -890,15 +891,18 @@ test "Server debug mdbg stdin" {
     if (is_windows) {
         try write_executable(fx.repo.dir, io, "fake-mdbg.cmd",
             \\@echo off
-            \\set /p line=
-            \\echo got:%line%
+            \\echo err 1>&2
+            \\powershell -NoProfile -Command "while ($null -ne ($l = [Console]::In.ReadLine())) { Write-Output ('line:' + $l) }; Write-Output eof"
             \\
         );
     } else {
         try write_executable(fx.repo.dir, io, "fake-mdbg.sh",
             \\#!/bin/sh
-            \\IFS= read -r line || exit 1
-            \\printf 'got:%s\n' "$line"
+            \\echo err >&2
+            \\while IFS= read -r line; do
+            \\  printf 'line:%s\n' "$line"
+            \\done
+            \\printf 'eof\n'
             \\
         );
     }
@@ -946,7 +950,150 @@ test "Server debug mdbg stdin" {
     try std.testing.expectEqual(handler.RunResult{ .exited = 0 }, capture.result.?);
     const out = capture.out.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "built") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "got:ping") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "line:ping") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "eof") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "err") != null);
     try std.testing.expectEqual(@as(usize, 1), notices.items.len);
     try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "mode=mdbg\n") != null);
+}
+
+test "rider password stays off the wire unless opted in" {
+    const io = std.testing.io;
+    var fx: ServerFixture = undefined;
+    try fx.init(".zig-cache/debug_pw_test", 8132);
+    defer fx.deinit();
+
+    const port: u16 = 18342;
+    const agent = if (is_windows) ".\\fake-agent.cmd" else "./fake-agent.py";
+    if (is_windows) {
+        try write_executable(fx.repo.dir, io, "fake-agent.cmd",
+            \\@echo off
+            \\echo Login: rideruser
+            \\echo Password: s3cret
+            \\echo Port: 18342
+            \\powershell -NoProfile -Command "$l=New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Parse('127.0.0.1'),18342); $l.Start(); try { while($true){ $c=$l.AcceptTcpClient(); $c.Close() } } finally { $l.Stop() }"
+            \\
+        );
+    } else {
+        try write_executable(fx.repo.dir, io, "fake-agent.py",
+            \\#!/usr/bin/env python3
+            \\import socket, sys
+            \\port = 18342
+            \\for arg in sys.argv[1:]:
+            \\    if arg.startswith("-port="):
+            \\        port = int(arg.split("=", 1)[1])
+            \\print("Login: rideruser", flush=True)
+            \\print("Password: s3cret", flush=True)
+            \\print(f"Port: {port}", flush=True)
+            \\s = socket.socket()
+            \\s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            \\s.bind(("127.0.0.1", port))
+            \\s.listen(8)
+            \\while True:
+            \\    c, _ = s.accept()
+            \\    c.close()
+            \\
+        );
+    }
+
+    const yaml = try std.fmt.allocPrint(std.testing.allocator,
+        \\commands:
+        \\  app:
+        \\    run: echo hi
+        \\    debug:
+        \\      mode: rider
+        \\      port: {d}
+        \\      agent: {s}
+        \\
+    , .{ port, agent });
+    defer std.testing.allocator.free(yaml);
+    _ = try fx.file.create_file("rmtbuild.yaml", yaml);
+
+    var notices: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notices.items) |item| std.testing.allocator.free(item);
+        notices.deinit(std.testing.allocator);
+    }
+    var capture = RunCapture.init();
+    defer capture.deinit();
+    try serveRunOpts(&fx, "app", &capture, .{ .notices = &notices });
+
+    try std.testing.expectEqual(handler.RunResult{ .exited = 0 }, capture.result.?);
+    try std.testing.expectEqual(@as(usize, 1), notices.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "\npassword=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "s3cret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, notices.items[0], "cleartext_password=0\n") != null);
+}
+
+test "debug refuses a port that is already open" {
+    const io = std.testing.io;
+    var fx: ServerFixture = undefined;
+    try fx.init(".zig-cache/debug_busy_test", 8133);
+    defer fx.deinit();
+
+    const port: u16 = 18343;
+    const addr = try net.IpAddress.parse("127.0.0.1", port);
+    var busy = try addr.listen(io, .{ .mode = .stream, .protocol = .tcp, .reuse_address = true });
+    defer busy.deinit(io);
+
+    const agent = if (is_windows) ".\\no-such-agent.cmd" else "./no-such-agent";
+    const yaml = try std.fmt.allocPrint(std.testing.allocator,
+        \\commands:
+        \\  app:
+        \\    run: echo hi
+        \\    debug:
+        \\      mode: msvsmon
+        \\      port: {d}
+        \\      agent: {s}
+        \\
+    , .{ port, agent });
+    defer std.testing.allocator.free(yaml);
+    _ = try fx.file.create_file("rmtbuild.yaml", yaml);
+
+    var capture = RunCapture.init();
+    defer capture.deinit();
+    try serveRunOpts(&fx, "app", &capture, .{});
+    const message = capture.result.?.failed;
+    try std.testing.expect(std.mem.indexOf(u8, message, "already listening") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, agent) != null);
+}
+
+test "debug failure names the env agent path" {
+    const io = std.testing.io;
+    var fx: ServerFixture = undefined;
+    try fx.init(".zig-cache/debug_env_test", 8134);
+    defer fx.deinit();
+
+    if (is_windows) {
+        try write_executable(fx.repo.dir, io, "exit-agent.cmd",
+            \\@echo off
+            \\exit /b 1
+            \\
+        );
+        fx.server.msvsmon_agent = ".\\exit-agent.cmd";
+    } else {
+        try write_executable(fx.repo.dir, io, "exit-agent.sh",
+            \\#!/bin/sh
+            \\exit 1
+            \\
+        );
+        fx.server.msvsmon_agent = "./exit-agent.sh";
+    }
+
+    _ = try fx.file.create_file("rmtbuild.yaml",
+        \\commands:
+        \\  app:
+        \\    run: echo hi
+        \\    debug:
+        \\      mode: msvsmon
+        \\      port: 18344
+        \\
+    );
+
+    var capture = RunCapture.init();
+    defer capture.deinit();
+    try serveRunOpts(&fx, "app", &capture, .{});
+    const message = capture.result.?.failed;
+    try std.testing.expect(std.mem.indexOf(u8, message, fx.server.msvsmon_agent.?) != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "RMTBUILD_MSVSMON") != null);
 }

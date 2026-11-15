@@ -72,7 +72,7 @@ commands:
 
 `debug: rider` is the short form of `mode: rider` with the default port.
 
-`run` has to leave the process running (the exe is the foreground of the script). The helper is stopped when the command ends. For `mdbg`, `run` is the build and must exit 0; `program` is what MDbg launches.
+`run` has to leave the process running (the exe is the foreground of the script). The helper is stopped when the command ends. For `mdbg`, `run` is the build and must exit 0; `program` is what MDbg launches. If `port` is below 1024 and `local` is omitted, the client binds `10000 + port` instead of that privileged port.
 
 While `mode` is `rider` or `msvsmon`, the script is started with `RMTBUILD_DEBUG_WAIT=1`. Wait on it so the process is still at the top of `Main` when the debugger attaches:
 
@@ -105,14 +105,25 @@ That filename is the one current Rider docs link. A newer Rider may want a newer
 
 rmtbuild starts it with `-port=<port>`, reads the `Login` / `Password` / `Port` banner, and prints where to point Rider. The first attach uploads Rider's remote debugger tools onto the server; that is Rider, not rmtbuild.
 
-The agent picks its own password and may listen on every interface. Connect through the forwarded `127.0.0.1` port and leave the Windows firewall closed for that port.
+**The connection is not encrypted, and `jetbrains_debugger_agent` listens on every interface.** Anyone who can read the rmtbuild traffic and learn the password can attach a debugger to the build machine. Anyone on the server's LAN can try the agent port directly unless the firewall blocks it.
 
-`start: false` does not launch an agent. It forwards `port` (for example `22`) to the client so Rider can use the Windows OpenSSH server you already run. Authenticate with that SSH account; there is no generated password.
+rmtbuild does **not** send the password to the client unless you opt in:
+
+```yaml
+debug:
+  mode: rider
+  allow_cleartext_password: true
+```
+
+Without that, the password is printed only on the server console (`rmtbuild serve`), with a warning. With it, the password is also printed by the client, in cleartext, and both sides warn. Block the agent port in the Windows firewall so only localhost (the rmtbuild forward) can connect. There is no flag on the agent to bind it to localhost.
+
+`start: false` does not launch an agent. It forwards `port` to the client so Rider can use the Windows OpenSSH server you already run. Authenticate with that SSH account; there is no generated password. A `port` below 1024 is not bound on the client (that would be `127.0.0.1:22`); the local side defaults to `10000 + port` unless you set `local`.
 
 ```yaml
 debug:
   mode: rider
   port: 22
+  local: 2222
   start: false
 ```
 
@@ -126,7 +137,9 @@ Visual Studio's remote debugger. Rider cannot connect to it.
 msvsmon.exe /noauth /anyuser /nosecuritywarn /silent /hostname 127.0.0.1 /port:<port>
 ```
 
-`/hostname 127.0.0.1` keeps the unauthenticated listener off the network. The only client is the rmtbuild forward. Do not open the port in the Windows firewall.
+`/hostname 127.0.0.1` keeps the unauthenticated listener off the network. Do not open the port in the Windows firewall.
+
+`/noauth` means there is no authentication. Any local user on the server can connect to `127.0.0.1:<port>` and debug or run code as the user running `rmtbuild serve`. The forwarded client port gives the same ability to whoever can open it. This is not a multi-user-safe setup.
 
 In Visual Studio: Debug, Attach to Process, connection type Remote (no authentication), target `127.0.0.1:<local port>`.
 

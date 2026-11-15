@@ -5,6 +5,7 @@ const config = @import("config.zig");
 const FileHandler = @import("file.zig").FileHandler;
 const handler = @import("rmt/handler.zig");
 const auth = @import("rmt/auth.zig");
+const debug_session = @import("debug_session.zig");
 
 const usage =
     \\usage: rmtbuild <command>                         sync files to the server, then run <command> there
@@ -107,9 +108,9 @@ fn serve(init: std.process.Init, defaults: config.Config, args: []const [:0]cons
 
     var server = handler.RmtServer.init(init.gpa, io, &files, load_key(init));
     server.max_payload = defaults.max_payload_mb * 1024 * 1024;
-    server.rider_agent = dupe_env(init.arena.allocator(), init.environ_map, "RMTBUILD_RIDER_AGENT");
-    server.msvsmon_agent = dupe_env(init.arena.allocator(), init.environ_map, "RMTBUILD_MSVSMON");
-    server.mdbg_agent = dupe_env(init.arena.allocator(), init.environ_map, "RMTBUILD_MDBG");
+    server.rider_agent = try dupe_env(init.arena.allocator(), init.environ_map, debug_session.rider_agent_env);
+    server.msvsmon_agent = try dupe_env(init.arena.allocator(), init.environ_map, debug_session.msvsmon_env);
+    server.mdbg_agent = try dupe_env(init.arena.allocator(), init.environ_map, debug_session.mdbg_env);
 
     handler.stop_commands_on_exit();
     std.log.info("serving on {s}:{d}", .{ listen, port });
@@ -136,10 +137,10 @@ fn run_command(init: std.process.Init, cfg: config.Config, name: []const u8) !u8
 
     // Before syncing, so a local port that's already taken fails straight away.
     const command = cfg.commands.get(name).?;
-    for (command.forward) |fwd| try forward_or_die(&rmt, fwd);
+    for (command.forward) |fwd| try forward_or_die(&rmt, fwd, .command);
     var debug_local: ?u16 = null;
     if (command.debug) |dbg| if (dbg.client_forward()) |fwd| {
-        try forward_or_die(&rmt, fwd);
+        try forward_or_die(&rmt, fwd, .debug);
         debug_local = fwd.local;
     };
 
@@ -200,15 +201,20 @@ fn print_usage(cfg: ?config.Config) void {
     }
 }
 
-fn dupe_env(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, key: []const u8) ?[]const u8 {
+fn dupe_env(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, key: []const u8) !?[]const u8 {
     const value = environ.get(key) orelse return null;
     if (value.len == 0) return null;
-    return allocator.dupe(u8, value) catch null;
+    return try allocator.dupe(u8, value);
 }
 
-fn forward_or_die(rmt: *handler.RmtHandler, fwd: config.Forward) !void {
+const ForwardKind = enum { command, debug };
+
+fn forward_or_die(rmt: *handler.RmtHandler, fwd: config.Forward, kind: ForwardKind) !void {
     _ = rmt.forward(fwd) catch |err| switch (err) {
-        error.AddressInUse => fatal("localhost:{d} is already in use, forward another port with e.g. 'forward: {d}:{d}'", .{ fwd.local, fwd.local +| 1, fwd.remote }),
+        error.AddressInUse => switch (kind) {
+            .command => fatal("localhost:{d} is already in use, forward another port with e.g. 'forward: {d}:{d}'", .{ fwd.local, fwd.local +| 1, fwd.remote }),
+            .debug => fatal("localhost:{d} is already in use for the debugger. Set debug.local to a free port (it is forwarded to the server's {d}).", .{ fwd.local, fwd.remote }),
+        },
         else => fatal("can't forward localhost:{d}: {s}", .{ fwd.local, @errorName(err) }),
     };
 }

@@ -63,16 +63,27 @@ const StdinPump = struct {
     fn run(self: *StdinPump) void {
         var rbuf: [1024]u8 = undefined;
         var reader = self.stdin.reader(self.io, &rbuf);
-        var wbuf: [256]u8 = undefined;
-        var writer = self.stream.writer(self.io, &wbuf);
         var tmp: [1024]u8 = undefined;
         while (!self.done.load(.acquire)) {
             const n = reader.interface.readSliceShort(&tmp) catch break;
             if (n == 0) break;
             if (self.done.load(.acquire)) break;
-            writer.interface.writeAll(tmp[0..n]) catch break;
-            writer.interface.flush() catch break;
+            if (!self.write_frame(tmp[0..n])) return;
         }
+        // Length 0 tells the server to close the debugger's stdin. Socket EOF stays
+        // "the client went away", which still kills the command.
+        _ = self.write_frame(&.{});
+    }
+
+    fn write_frame(self: *StdinPump, data: []const u8) bool {
+        var hdr: [4]u8 = undefined;
+        std.mem.writeInt(u32, &hdr, @intCast(data.len), .little);
+        var wbuf: [256]u8 = undefined;
+        var writer = self.stream.writer(self.io, &wbuf);
+        writer.interface.writeAll(&hdr) catch return false;
+        if (data.len != 0) writer.interface.writeAll(data) catch return false;
+        writer.interface.flush() catch return false;
+        return true;
     }
 };
 
@@ -357,7 +368,8 @@ pub const RmtHandler = struct {
                         debug_session.print_notice(payload.bytes, options.debug_local);
                     }
                     if (options.stdin) |stdin| {
-                        if (pump == null and std.mem.indexOf(u8, payload.bytes, "mode=mdbg\n") != null) {
+                        const mode = debug_session.notice_value(payload.bytes, "mode") orelse "";
+                        if (pump == null and std.mem.eql(u8, mode, "mdbg")) {
                             const started = try self.allocator.create(StdinPump);
                             started.* = .{ .io = self.io, .stdin = stdin, .stream = stream };
                             pump = started;
@@ -643,6 +655,11 @@ pub const RmtServer = struct {
         const pending = try self.allocator.alloc(u8, if (mdbg) 64 * 1024 else 0);
         defer self.allocator.free(pending);
 
+        // Deinited after the watcher is joined (that defer is registered below), so a
+        // disconnect during MDbg still has a live process to kill.
+        var debugging: ?process.Running = null;
+        defer if (debugging) |*dbg_proc| dbg_proc.deinit();
+
         var running = process.spawn(self.io, self.allocator, self.file_handler.root, self.file_handler.child_cwd(), script) catch |err|
             return self.run_failed(request, stream, "failed to start '{s}': {s}", .{ name, @errorName(err) });
         defer running.deinit();
@@ -677,20 +694,19 @@ pub const RmtServer = struct {
             };
             if (!build_ok) return self.send_term(request, stream, name, first.exit);
 
+            const agent = debug_session.resolve_agent(builtin.os.tag, .mdbg, dbg.agent, self.mdbg_agent);
+            const argv = try debug_session.mdbg_argv(alloc, builtin.os.tag, agent, dbg.program.?, dbg.args);
+            debugging = process.spawn_merged_argv(self.io, self.allocator, self.file_handler.child_cwd(), argv, .{ .stdin = .pipe }) catch |err|
+                return self.run_failed(request, stream, "failed to start '{s}' ({s}): {s}", .{ agent, debug_session.env_name(.mdbg), @errorName(err) });
+            const dbg_proc = &debugging.?;
+
+            const stdin = dbg_proc.input() orelse return self.run_failed(request, stream, "failed to start '{s}': no stdin pipe", .{agent});
+            try watch.arm_stdin(self.allocator, dbg_proc, stdin);
+
             const notice = try debug_session.format_notice(alloc, .{ .mode = .mdbg });
             try self.send_notice(request, stream, notice);
 
-            const agent = debug_session.resolve_agent(builtin.os.tag, .mdbg, dbg.agent, self.mdbg_agent);
-            const argv = try debug_session.mdbg_argv(alloc, builtin.os.tag, agent, dbg.program.?, dbg.args);
-            var debugging = process.spawn_argv(self.io, self.allocator, self.file_handler.child_cwd(), argv, .{ .stdin = .pipe }) catch |err|
-                return self.run_failed(request, stream, "failed to start '{s}' ({s}): {s}", .{ agent, debug_session.env_name(.mdbg), @errorName(err) });
-            defer debugging.deinit();
-            // Runs before `debugging.deinit`, while the watcher may still be stopping the tree.
-            defer watch.point_at(&running);
-
-            const stdin = debugging.input() orelse return self.run_failed(request, stream, "failed to start '{s}': no stdin pipe", .{agent});
-            try watch.arm_stdin(self.allocator, &debugging, stdin);
-            const second = try self.pump_output(request, stream, &debugging, &watch);
+            const second = try self.pump_output(request, stream, dbg_proc, &watch);
             if (second.client_gone) {
                 std.log.info("rmt: client disconnected, stopped '{s}'", .{name});
                 return;
@@ -713,13 +729,19 @@ pub const RmtServer = struct {
     ) !bool {
         const port = dbg.port.?;
         var creds: ?debug_session.Credentials = null;
+        const agent = debug_session.resolve_agent(builtin.os.tag, dbg.mode, dbg.agent, switch (dbg.mode) {
+            .rider => self.rider_agent,
+            .msvsmon => self.msvsmon_agent,
+            .mdbg => self.mdbg_agent,
+        });
 
         if (dbg.start) {
-            const agent = debug_session.resolve_agent(builtin.os.tag, dbg.mode, dbg.agent, switch (dbg.mode) {
-                .rider => self.rider_agent,
-                .msvsmon => self.msvsmon_agent,
-                .mdbg => self.mdbg_agent,
-            });
+            // A listener that is already up is not msvsmon (or the agent). Attaching the
+            // client to it would debug whatever else bound the port.
+            if (debug_session.port_open(self.io, port)) {
+                try self.debug_start_failed(request, stream, dbg, agent, error.PortInUse, null);
+                return false;
+            }
             const argv = try debug_session.listener_argv(alloc, builtin.os.tag, dbg.mode, agent, port);
             const helper = debug_session.Listener.spawn(self.allocator, self.io, self.file_handler.child_cwd(), argv) catch |err| {
                 try self.debug_start_failed(request, stream, dbg, agent, err, null);
@@ -735,10 +757,40 @@ pub const RmtServer = struct {
             }
         }
 
-        debug_session.wait_listening(self.io, port, debug_session.ready_timeout_ms) catch |err| {
-            const agent = debug_session.resolve_agent(builtin.os.tag, dbg.mode, dbg.agent, null);
-            try self.debug_start_failed(request, stream, dbg, agent, err, listener.*);
-            return false;
+        {
+            const start = std.Io.Timestamp.now(self.io, .awake);
+            while (true) {
+                if (debug_session.port_open(self.io, port)) break;
+                if (listener.*) |helper| if (helper.stdio_ended()) {
+                    try self.debug_start_failed(request, stream, dbg, agent, error.AgentExited, helper);
+                    return false;
+                };
+                const elapsed = start.durationTo(std.Io.Timestamp.now(self.io, .awake)).toMilliseconds();
+                if (elapsed > debug_session.ready_timeout_ms) {
+                    try self.debug_start_failed(request, stream, dbg, agent, error.DebugPortClosed, listener.*);
+                    return false;
+                }
+                self.io.sleep(.fromMilliseconds(50), .awake) catch {
+                    try self.debug_start_failed(request, stream, dbg, agent, error.DebugPortClosed, listener.*);
+                    return false;
+                };
+            }
+            if (listener.*) |helper| if (helper.stdio_ended()) {
+                try self.debug_start_failed(request, stream, dbg, agent, error.AgentExited, helper);
+                return false;
+            };
+        }
+
+        if (dbg.mode == .msvsmon) {
+            std.log.warn("msvsmon /noauth is on localhost only. Any local user on this machine can attach and run code as the rmtbuild user. The forwarded port exposes that to the client. Do not open the port in the firewall.", .{});
+        }
+        const send_password = dbg.mode == .rider and dbg.start and dbg.allow_cleartext_password;
+        if (dbg.mode == .rider and dbg.start) if (creds) |c| {
+            if (send_password) {
+                std.log.warn("sending the JetBrains agent password in cleartext on the unencrypted rmtbuild connection. The agent listens on every interface; firewall that port so only localhost can reach it. user={s} password={s}", .{ c.login, c.password });
+            } else {
+                std.log.warn("JetBrains agent password was NOT sent to the client (the rmtbuild connection is not encrypted, and the agent listens on every interface). Firewall that port. user={s} password={s}. Set debug.allow_cleartext_password: true to send the password anyway.", .{ c.login, c.password });
+            }
         };
 
         const notice = try debug_session.format_notice(alloc, .{
@@ -747,6 +799,7 @@ pub const RmtServer = struct {
             .port = port,
             .login = if (creds) |c| c.login else null,
             .password = if (creds) |c| c.password else null,
+            .cleartext_password = send_password,
         });
         try self.send_notice(request, stream, notice);
         return true;
@@ -770,6 +823,7 @@ pub const RmtServer = struct {
             error.AgentExited => "exited before it was ready",
             error.PortMismatch => "listened on a different port than requested",
             error.DebugPortClosed => "nothing accepted a connection on its port",
+            error.PortInUse => "something is already listening on that port, so it is not the debugger we would start",
             else => @errorName(err),
         };
         const where = if (!dbg.start) "already-running debugger" else agent;
@@ -951,10 +1005,12 @@ pub const RmtServer = struct {
 const RunWatch = struct {
     io: std.Io,
     stream: net.Stream,
-    running: *const process.Running,
+    running: *process.Running,
     lock: std.Io.Mutex = .init,
     /// Set while an mdbg process should receive client bytes.
     stdin: ?std.Io.File = null,
+    /// A zero-length stdin frame arrived. Further bytes are dropped and the pipe is closed.
+    stdin_closed: bool = false,
     pending: []u8 = &.{},
     pending_len: usize = 0,
     /// Buffer client bytes until `arm_stdin` instead of discarding them.
@@ -962,7 +1018,7 @@ const RunWatch = struct {
     finished: std.atomic.Value(bool) = .init(false),
     disconnected: std.atomic.Value(bool) = .init(false),
 
-    fn point_at(self: *RunWatch, running: *const process.Running) void {
+    fn point_at(self: *RunWatch, running: *process.Running) void {
         self.lock.lockUncancelable(self.io);
         self.running = running;
         self.lock.unlock(self.io);
@@ -970,10 +1026,16 @@ const RunWatch = struct {
 
     /// Points the watcher at `running` and flushes bytes buffered during the build.
     /// Further client bytes are written straight to `file`.
-    fn arm_stdin(self: *RunWatch, allocator: std.mem.Allocator, running: *const process.Running, file: std.Io.File) !void {
+    fn arm_stdin(self: *RunWatch, allocator: std.mem.Allocator, running: *process.Running, file: std.Io.File) !void {
         self.point_at(running);
         while (true) {
             self.lock.lockUncancelable(self.io);
+            if (self.stdin_closed) {
+                self.stdin = null;
+                running.close_input();
+                self.lock.unlock(self.io);
+                return;
+            }
             const n = self.pending_len;
             if (n == 0) {
                 self.stdin = file;
@@ -996,7 +1058,15 @@ const RunWatch = struct {
         }
     }
 
-    fn current(self: *RunWatch) *const process.Running {
+    fn close_child_stdin(self: *RunWatch) void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        self.stdin_closed = true;
+        self.stdin = null;
+        self.running.close_input();
+    }
+
+    fn current(self: *RunWatch) *process.Running {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         return self.running;
@@ -1004,38 +1074,28 @@ const RunWatch = struct {
 
     fn absorb(self: *RunWatch, data: []const u8) void {
         self.lock.lockUncancelable(self.io);
-        const file = self.stdin;
-        if (file == null) {
-            if (self.buffer_stdin) {
-                const room = self.pending.len - self.pending_len;
-                if (data.len > room) {
-                    self.lock.unlock(self.io);
-                    self.disconnected.store(true, .release);
-                    self.current().stop();
-                    return;
-                }
-                @memcpy(self.pending[self.pending_len..][0..data.len], data);
-                self.pending_len += data.len;
-            }
-            self.lock.unlock(self.io);
+        defer self.lock.unlock(self.io);
+        if (self.stdin_closed) return;
+        if (self.stdin) |file| {
+            file.writeStreamingAll(self.io, data) catch {
+                self.disconnected.store(true, .release);
+                self.running.stop();
+            };
             return;
         }
-        self.lock.unlock(self.io);
-        file.?.writeStreamingAll(self.io, data) catch {
+        if (!self.buffer_stdin) return;
+        const room = self.pending.len - self.pending_len;
+        if (data.len > room) {
             self.disconnected.store(true, .release);
-            self.current().stop();
-        };
+            self.running.stop();
+            return;
+        }
+        @memcpy(self.pending[self.pending_len..][0..data.len], data);
+        self.pending_len += data.len;
     }
 
     fn run(self: *RunWatch) void {
-        var buf: [1024]u8 = undefined;
-        var reader = self.stream.reader(self.io, &buf);
-        while (true) {
-            reader.interface.fillMore() catch break;
-            const data = reader.interface.buffered();
-            if (data.len != 0) self.absorb(data);
-            reader.interface.toss(data.len);
-        }
+        if (self.buffer_stdin) self.run_framed() else self.run_discard();
         if (self.finished.load(.acquire)) return;
 
         self.disconnected.store(true, .release);
@@ -1048,16 +1108,62 @@ const RunWatch = struct {
         }
         self.current().kill();
     }
+
+    /// Non-mdbg clients send nothing. Any bytes are ignored; EOF is the client leaving.
+    fn run_discard(self: *RunWatch) void {
+        var buf: [1024]u8 = undefined;
+        var reader = self.stream.reader(self.io, &buf);
+        while (true) {
+            reader.interface.fillMore() catch break;
+            reader.interface.tossBuffered();
+        }
+    }
+
+    /// mdbg stdin is length-prefixed. A length of 0 closes the child's stdin (Ctrl-D).
+    /// EOF on the socket is still the client disconnecting.
+    fn run_framed(self: *RunWatch) void {
+        var buf: [1024]u8 = undefined;
+        var reader = self.stream.reader(self.io, &buf);
+        var header: [4]u8 = undefined;
+        var header_got: usize = 0;
+        var need: ?usize = null;
+        while (true) {
+            reader.interface.fillMore() catch break;
+            const data = reader.interface.buffered();
+            var i: usize = 0;
+            while (i < data.len) {
+                if (need == null) {
+                    const take = @min(4 - header_got, data.len - i);
+                    @memcpy(header[header_got..][0..take], data[i..][0..take]);
+                    header_got += take;
+                    i += take;
+                    if (header_got < 4) continue;
+                    const len = std.mem.readInt(u32, &header, .little);
+                    header_got = 0;
+                    if (len == 0) {
+                        self.close_child_stdin();
+                    } else if (len > 1024 * 1024) {
+                        self.disconnected.store(true, .release);
+                        self.current().stop();
+                        reader.interface.toss(data.len);
+                        return;
+                    } else {
+                        need = len;
+                    }
+                } else {
+                    const left = need.?;
+                    const take = @min(left, data.len - i);
+                    self.absorb(data[i..][0..take]);
+                    i += take;
+                    if (take == left) need = null else need = left - take;
+                }
+            }
+            reader.interface.toss(data.len);
+        }
+    }
 };
 
 /// Makes `rmtbuild serve` stop running commands before it exits.
 pub const stop_commands_on_exit = process.stop_all_on_exit;
 
-fn connect_localhost(io: std.Io, port: u16) !net.Stream {
-    // Servers often bind only one of the two loopback addresses.
-    const v4 = try net.IpAddress.parse("127.0.0.1", port);
-    return v4.connect(io, .{ .mode = .stream }) catch {
-        const v6 = try net.IpAddress.parse("::1", port);
-        return v6.connect(io, .{ .mode = .stream });
-    };
-}
+const connect_localhost = debug_session.connect_localhost;

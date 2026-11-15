@@ -98,6 +98,8 @@ pub const Notice = struct {
     port: ?u16 = null,
     login: ?[]const u8 = null,
     password: ?[]const u8 = null,
+    /// When false, login and password are omitted. The server console still has them.
+    cleartext_password: bool = false,
 };
 
 pub fn format_notice(allocator: std.mem.Allocator, notice: Notice) ![]u8 {
@@ -105,12 +107,17 @@ pub fn format_notice(allocator: std.mem.Allocator, notice: Notice) ![]u8 {
     errdefer out.deinit();
     try out.writer.print("mode={s}\nstarted={s}\n", .{ @tagName(notice.mode), if (notice.started) "1" else "0" });
     if (notice.port) |port| try out.writer.print("port={d}\n", .{port});
-    if (notice.login) |login| try out.writer.print("login={s}\n", .{login});
-    if (notice.password) |password| try out.writer.print("password={s}\n", .{password});
+    if (notice.mode == .rider) {
+        try out.writer.print("cleartext_password={s}\n", .{if (notice.cleartext_password) "1" else "0"});
+        if (notice.cleartext_password) {
+            if (notice.login) |login| try out.writer.print("login={s}\n", .{login});
+            if (notice.password) |password| try out.writer.print("password={s}\n", .{password});
+        }
+    }
     return out.toOwnedSlice();
 }
 
-fn notice_value(text: []const u8, key: []const u8) ?[]const u8 {
+pub fn notice_value(text: []const u8, key: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < text.len) {
         const end = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len;
@@ -140,9 +147,12 @@ pub fn format_banner(w: *std.Io.Writer, notice_text: []const u8, local: ?u16) !v
 
     if (std.mem.eql(u8, mode, "msvsmon")) {
         try w.print(
+            \\rmtbuild: WARNING: msvsmon is running with /noauth, bound to the server's localhost.
+            \\rmtbuild: Any local user on that machine can attach and run code as the user running rmtbuild.
+            \\rmtbuild: The forwarded port exposes that to whoever can open it on this machine.
             \\rmtbuild: Visual Studio remote debugger is forwarded to 127.0.0.1:{d}
             \\rmtbuild: Visual Studio: Debug > Attach to Process, connection type "Remote (no authentication)", target 127.0.0.1:{d}
-            \\rmtbuild: msvsmon is bound to the server's localhost. Leave that port closed on the firewall; the rmtbuild tunnel is the way in.
+            \\rmtbuild: Do not open this port on the server firewall. Loopback is the only listener, on purpose.
             \\
         , .{ shown, shown });
         return;
@@ -161,9 +171,26 @@ pub fn format_banner(w: *std.Io.Writer, notice_text: []const u8, local: ?u16) !v
         return;
     }
 
+    const clear = if (notice_value(notice_text, "cleartext_password")) |v| std.mem.eql(u8, v, "1") else false;
+    if (!clear) {
+        try w.print(
+            \\rmtbuild: WARNING: the JetBrains agent password was NOT sent to this machine.
+            \\rmtbuild: The rmtbuild connection is not encrypted, and the agent listens on every interface.
+            \\rmtbuild: Anyone who can sniff this network and learn the password can attach a debugger.
+            \\rmtbuild: The password is on the server console. Firewall the agent port off the LAN.
+            \\rmtbuild: Set debug.allow_cleartext_password: true only if you accept sending it in cleartext.
+            \\rmtbuild: Rider: Run | Attach to Remote Process, host 127.0.0.1, port {d}
+            \\
+        , .{shown});
+        return;
+    }
+
     const login = notice_value(notice_text, "login") orelse "";
     const password = notice_value(notice_text, "password") orelse "";
     try w.print(
+        \\rmtbuild: WARNING: agent password is on this unencrypted connection, in cleartext.
+        \\rmtbuild: The agent listens on every interface. Firewall that port. Anyone who can read
+        \\rmtbuild: this network can attach a debugger with the password below.
         \\rmtbuild: JetBrains debugger agent is forwarded to 127.0.0.1:{d}
         \\rmtbuild: Rider: Run | Attach to Remote Process
         \\rmtbuild:   host: 127.0.0.1
@@ -283,35 +310,19 @@ pub fn with_wait_env(allocator: std.mem.Allocator, os: std.Target.Os.Tag, script
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, script });
 }
 
-pub fn split_args(arena: std.mem.Allocator, text: []const u8) error{ UnterminatedQuote, OutOfMemory }![]const []const u8 {
-    var list: std.ArrayList([]const u8) = .empty;
-    var i: usize = 0;
-    while (i < text.len) {
-        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
-        if (i >= text.len) break;
-        if (text[i] == '"' or text[i] == '\'') {
-            const quote = text[i];
-            i += 1;
-            const start = i;
-            while (i < text.len and text[i] != quote) i += 1;
-            if (i >= text.len) return error.UnterminatedQuote;
-            try list.append(arena, text[start..i]);
-            i += 1;
-        } else {
-            const start = i;
-            while (i < text.len and text[i] != ' ' and text[i] != '\t') i += 1;
-            try list.append(arena, text[start..i]);
-        }
-    }
-    return list.items;
-}
-
-fn connect_localhost(io: std.Io, port: u16) !std.Io.net.Stream {
+pub fn connect_localhost(io: std.Io, port: u16) !std.Io.net.Stream {
     const v4 = try std.Io.net.IpAddress.parse("127.0.0.1", port);
     return v4.connect(io, .{ .mode = .stream }) catch {
         const v6 = try std.Io.net.IpAddress.parse("::1", port);
         return v6.connect(io, .{ .mode = .stream });
     };
+}
+
+pub fn port_open(io: std.Io, port: u16) bool {
+    if (connect_localhost(io, port)) |stream| {
+        stream.close(io);
+        return true;
+    } else |_| return false;
 }
 
 /// Returns once something accepts TCP on localhost:`port`, or `error.DebugPortClosed`.
@@ -450,6 +461,11 @@ pub const Listener = struct {
         };
     }
 
+    /// Both pipes closed: the helper has gone away (or at least isn't writing anymore).
+    pub fn stdio_ended(self: *const Listener) bool {
+        return self.stdout_eof.load(.acquire) and self.stderr_eof.load(.acquire);
+    }
+
     pub fn copy_output(self: *Listener, allocator: std.mem.Allocator) ![]u8 {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
@@ -479,10 +495,13 @@ fn pump(
         lock.lockUncancelable(io);
         const room = buf.len - len.*;
         const take = @min(room, n);
-        @memcpy(buf[len.*..][0..take], tmp[0..take]);
-        len.* += take;
+        if (take != 0) {
+            @memcpy(buf[len.*..][0..take], tmp[0..take]);
+            len.* += take;
+        }
         lock.unlock(io);
-        if (take < n) break;
+        // Past the cap, keep reading so a chatty helper doesn't block on a full pipe.
+        // Stopping here used to look like the process had exited.
     }
     eof.store(true, .release);
 }
@@ -546,8 +565,9 @@ test "notice banner" {
         .port = 7777,
         .login = "rideruser",
         .password = "s3cret",
+        .cleartext_password = true,
     });
-    var buf: [1024]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try format_banner(&w, notice, 7000);
     const text = w.buffered();
@@ -557,15 +577,45 @@ test "notice banner" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Attach to Remote Process") != null);
 }
 
-test "split args" {
+test "notice omits the password unless cleartext is opted in" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const args = try split_args(arena.allocator(), "one \"two three\" 'x'");
-    try std.testing.expectEqual(@as(usize, 3), args.len);
-    try std.testing.expectEqualStrings("one", args[0]);
-    try std.testing.expectEqualStrings("two three", args[1]);
-    try std.testing.expectEqualStrings("x", args[2]);
-    try std.testing.expectError(error.UnterminatedQuote, split_args(arena.allocator(), "\"nope"));
+    const hidden = try format_notice(arena.allocator(), .{
+        .mode = .rider,
+        .port = 7777,
+        .login = "rideruser",
+        .password = "s3cret",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "s3cret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "cleartext_password=0\n") != null);
+
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try format_banner(&w, hidden, 7777);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "NOT sent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "s3cret") == null);
+}
+
+test "capture keeps draining after the buffer fills" {
+    const io = std.testing.io;
+    const builtin = @import("builtin");
+    const argv: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "powershell.exe", "-NoProfile", "-Command", "'x' * 40000 | Write-Host -NoNewline; Start-Sleep -Seconds 30" }
+    else
+        &.{ "sh", "-c", "python3 -c 'import sys,time; sys.stdout.write(\"x\"*40000); sys.stdout.flush(); time.sleep(30)'" };
+
+    const listener = try Listener.spawn(std.testing.allocator, io, .inherit, argv);
+    defer listener.deinit();
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    while (listener.stdout_len < listener.stdout_buf.len) {
+        const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+        if (elapsed > 5_000) return error.TestExpectedEqual;
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try std.testing.expect(!listener.stdout_eof.load(.acquire));
+    try std.testing.expect(!listener.stdio_ended());
 }
 
 test "wait until a port listens" {

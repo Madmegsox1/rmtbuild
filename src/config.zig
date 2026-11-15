@@ -80,6 +80,9 @@ pub const Debug = struct {
     agent: ?[]const u8 = null,
     /// When false, don't start a helper; something is already listening (OpenSSH, a running msvsmon).
     start: bool = true,
+    /// Send the JetBrains agent password to the client. The rmtbuild connection is not
+    /// encrypted, and the agent listens on every interface, so this is off unless set.
+    allow_cleartext_password: bool = false,
     /// Program `mdbg` launches after `run` exits 0.
     program: ?[]const u8 = null,
     args: []const []const u8 = &.{},
@@ -211,7 +214,7 @@ pub const Config = struct {
                         error.InvalidPort => return fail_fmt(arena, diag, "{s}.forward: '{s}' should be ports like '8080', '8080, 3000' or '8081:8080'", .{ path, text }),
                     };
                 } else if (std.mem.eql(u8, field.key_ptr.*, "debug")) {
-                    debug = try self.parse_debug(arena, path, field.value_ptr.*, diag);
+                    debug = try parse_debug(arena, path, field.value_ptr.*, diag);
                 } else {
                     return fail_fmt(arena, diag, "{s}: unknown key '{s}', expected 'run', 'forward' or 'debug'", .{ path, field.key_ptr.* });
                 }
@@ -231,58 +234,6 @@ pub const Config = struct {
         }
     }
 
-    fn parse_debug(self: *Config, arena: Allocator, path: []const u8, node: Node, diag: *Diagnostic) !Debug {
-        _ = self;
-        const debug_path = try std.fmt.allocPrint(arena, "{s}.debug", .{path});
-
-        if (node == .scalar) {
-            const mode = try parse_debug_mode(arena, debug_path, node.scalar, diag);
-            return finish_debug(arena, debug_path, mode, null, null, null, true, null, &.{}, diag);
-        }
-
-        const fields = try expect_map(arena, node, debug_path, diag);
-        var mode: ?DebugMode = null;
-        var port: ?u16 = null;
-        var local: ?u16 = null;
-        var agent: ?[]const u8 = null;
-        var program: ?[]const u8 = null;
-        var args: []const []const u8 = &.{};
-        var start: ?bool = null;
-
-        var it = fields.iterator();
-        while (it.next()) |field| {
-            const key = field.key_ptr.*;
-            const value = try expect_scalar(arena, field.value_ptr.*, debug_path, key, diag);
-            if (std.mem.eql(u8, key, "mode")) {
-                mode = try parse_debug_mode(arena, debug_path, value, diag);
-            } else if (std.mem.eql(u8, key, "port") or std.mem.eql(u8, key, "local")) {
-                const number = std.fmt.parseInt(u16, value, 10) catch 0;
-                if (number == 0) return fail_fmt(arena, diag, "{s}.{s}: '{s}' isn't a port", .{ debug_path, key, value });
-                if (std.mem.eql(u8, key, "port")) port = number else local = number;
-            } else if (std.mem.eql(u8, key, "agent")) {
-                if (value.len == 0) return fail_fmt(arena, diag, "{s}.agent is empty", .{debug_path});
-                agent = value;
-            } else if (std.mem.eql(u8, key, "program")) {
-                if (value.len == 0) return fail_fmt(arena, diag, "{s}.program is empty", .{debug_path});
-                program = value;
-            } else if (std.mem.eql(u8, key, "args")) {
-                args = split_debug_args(arena, value) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.UnterminatedQuote => return fail_fmt(arena, diag, "{s}.args: unterminated quote in '{s}'", .{ debug_path, value }),
-                };
-            } else if (std.mem.eql(u8, key, "start")) {
-                if (std.mem.eql(u8, value, "true")) start = true else if (std.mem.eql(u8, value, "false")) start = false else {
-                    return fail_fmt(arena, diag, "{s}.start: '{s}' should be true or false", .{ debug_path, value });
-                }
-            } else {
-                return fail_fmt(arena, diag, "{s}: unknown key '{s}', expected 'mode', 'port', 'local', 'agent', 'program', 'args' or 'start'", .{ debug_path, key });
-            }
-        }
-
-        const parsed_mode = mode orelse return fail_fmt(arena, diag, "{s}: missing 'mode' (rider, msvsmon or mdbg)", .{debug_path});
-        return finish_debug(arena, debug_path, parsed_mode, port, local, agent, start orelse true, program, args, diag);
-    }
-
     fn expect_map(arena: Allocator, node: Node, path: []const u8, diag: *Diagnostic) !Node.Map {
         return switch (node) {
             .map => |m| m,
@@ -297,6 +248,64 @@ pub const Config = struct {
         };
     }
 };
+
+fn parse_debug(arena: Allocator, path: []const u8, node: Node, diag: *Diagnostic) !Debug {
+    const debug_path = try std.fmt.allocPrint(arena, "{s}.debug", .{path});
+
+    if (node == .scalar) {
+        const mode = try parse_debug_mode(arena, debug_path, node.scalar, diag);
+        return finish_debug(arena, debug_path, mode, null, null, null, true, false, null, &.{}, diag);
+    }
+
+    const fields = try Config.expect_map(arena, node, debug_path, diag);
+    var mode: ?DebugMode = null;
+    var port: ?u16 = null;
+    var local: ?u16 = null;
+    var agent: ?[]const u8 = null;
+    var program: ?[]const u8 = null;
+    var args: []const []const u8 = &.{};
+    var start: ?bool = null;
+    var cleartext: ?bool = null;
+
+    var it = fields.iterator();
+    while (it.next()) |field| {
+        const key = field.key_ptr.*;
+        const value = try Config.expect_scalar(arena, field.value_ptr.*, debug_path, key, diag);
+        if (std.mem.eql(u8, key, "mode")) {
+            mode = try parse_debug_mode(arena, debug_path, value, diag);
+        } else if (std.mem.eql(u8, key, "port") or std.mem.eql(u8, key, "local")) {
+            const number = std.fmt.parseInt(u16, value, 10) catch 0;
+            if (number == 0) return fail_fmt(arena, diag, "{s}.{s}: '{s}' isn't a port", .{ debug_path, key, value });
+            if (std.mem.eql(u8, key, "port")) port = number else local = number;
+        } else if (std.mem.eql(u8, key, "agent")) {
+            if (value.len == 0) return fail_fmt(arena, diag, "{s}.agent is empty", .{debug_path});
+            agent = value;
+        } else if (std.mem.eql(u8, key, "program")) {
+            if (value.len == 0) return fail_fmt(arena, diag, "{s}.program is empty", .{debug_path});
+            program = value;
+        } else if (std.mem.eql(u8, key, "args")) {
+            args = split_args(arena, value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnterminatedQuote => return fail_fmt(arena, diag, "{s}.args: unterminated quote in '{s}'", .{ debug_path, value }),
+            };
+        } else if (std.mem.eql(u8, key, "start")) {
+            start = try parse_bool(arena, debug_path, "start", value, diag);
+        } else if (std.mem.eql(u8, key, "allow_cleartext_password")) {
+            cleartext = try parse_bool(arena, debug_path, "allow_cleartext_password", value, diag);
+        } else {
+            return fail_fmt(arena, diag, "{s}: unknown key '{s}', expected 'mode', 'port', 'local', 'agent', 'program', 'args', 'start' or 'allow_cleartext_password'", .{ debug_path, key });
+        }
+    }
+
+    const parsed_mode = mode orelse return fail_fmt(arena, diag, "{s}: missing 'mode' (rider, msvsmon or mdbg)", .{debug_path});
+    return finish_debug(arena, debug_path, parsed_mode, port, local, agent, start orelse true, cleartext orelse false, program, args, diag);
+}
+
+fn parse_bool(arena: Allocator, path: []const u8, key: []const u8, value: []const u8, diag: *Diagnostic) !bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return fail_fmt(arena, diag, "{s}.{s}: '{s}' should be true or false", .{ path, key, value });
+}
 
 fn parse_debug_mode(arena: Allocator, path: []const u8, text: []const u8, diag: *Diagnostic) !DebugMode {
     if (std.mem.eql(u8, text, "rider")) return .rider;
@@ -313,10 +322,12 @@ fn finish_debug(
     local: ?u16,
     agent: ?[]const u8,
     start: bool,
+    cleartext: bool,
     program: ?[]const u8,
     args: []const []const u8,
     diag: *Diagnostic,
 ) !Debug {
+    if (cleartext and mode != .rider) return fail_fmt(arena, diag, "{s}: allow_cleartext_password is only for mode rider", .{path});
     switch (mode) {
         .mdbg => {
             if (!start) return fail_fmt(arena, diag, "{s}: mdbg always starts the debugger, remove 'start'", .{path});
@@ -332,19 +343,23 @@ fn finish_debug(
                 .msvsmon => default_msvsmon_port,
                 .mdbg => unreachable,
             };
+            // Binding 127.0.0.1:22 (or any privileged port) is a footgun. Ports below 1024
+            // get a high local port unless `local` is set explicitly.
+            const client = local orelse if (chosen < 1024) chosen + 10000 else chosen;
             return .{
                 .mode = mode,
                 .port = chosen,
-                .local = local orelse chosen,
+                .local = client,
                 .agent = agent,
                 .start = start,
+                .allow_cleartext_password = cleartext,
             };
         },
     }
 }
 
 /// Whitespace-separated, with `'...'` and `"..."` quoting. No escapes.
-fn split_debug_args(arena: Allocator, text: []const u8) error{ UnterminatedQuote, OutOfMemory }![]const []const u8 {
+pub fn split_args(arena: Allocator, text: []const u8) error{ UnterminatedQuote, OutOfMemory }![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
     while (i < text.len) {
@@ -722,6 +737,9 @@ test "Config debug" {
     const ssh = config.commands.get("ssh").?.debug.?;
     try std.testing.expect(!ssh.start);
     try std.testing.expectEqual(@as(?u16, 22), ssh.port);
+    // 22 is not bound on the client; local defaults to 10000+port.
+    try std.testing.expectEqual(@as(?u16, 10022), ssh.local);
+    try std.testing.expect(!ssh.allow_cleartext_password);
 }
 
 test "Config defaults" {

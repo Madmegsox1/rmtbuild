@@ -30,6 +30,14 @@ pub const Running = struct {
         return self.child.stdin;
     }
 
+    /// Closes the child's stdin so it sees EOF. Safe to call twice.
+    pub fn close_input(self: *Running) void {
+        if (self.child.stdin) |file| {
+            file.close(self.io);
+            self.child.stdin = null;
+        }
+    }
+
     /// The read end of the child's stderr, when spawned with `stderr = .pipe`.
     pub fn error_output(self: *Running) ?std.Io.File {
         return self.child.stderr;
@@ -78,6 +86,33 @@ pub const ArgvOptions = struct {
     stdin: enum { ignore, pipe } = .ignore,
     stderr: enum { inherit, pipe } = .inherit,
 };
+
+/// Like `spawn_argv`, but the child's stderr is merged into its stdout the same way a
+/// configured command's script is (`exec 2>&1` / `cmd /c ... 2>&1`).
+pub fn spawn_merged_argv(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cwd: std.process.Child.Cwd,
+    argv: []const []const u8,
+    opts: ArgvOptions,
+) !Running {
+    var wrapped: std.ArrayList([]const u8) = .empty;
+    defer wrapped.deinit(allocator);
+    if (is_windows) {
+        try wrapped.append(allocator, "cmd.exe");
+        try wrapped.append(allocator, "/d");
+        try wrapped.append(allocator, "/c");
+        try wrapped.appendSlice(allocator, argv);
+        try wrapped.append(allocator, "2>&1");
+    } else {
+        try wrapped.append(allocator, "sh");
+        try wrapped.append(allocator, "-c");
+        try wrapped.append(allocator, "exec \"$@\" 2>&1");
+        try wrapped.append(allocator, "sh");
+        try wrapped.appendSlice(allocator, argv);
+    }
+    return spawn_argv(io, allocator, cwd, wrapped.items, .{ .stdin = opts.stdin });
+}
 
 /// Runs `argv` directly (no shell), in a process group / job so `Running.deinit` stops the tree.
 /// `argv` is not copied; it only needs to live until this returns.
