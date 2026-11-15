@@ -5,11 +5,6 @@
 //! tabs for indentation, multiple documents.
 //!
 //! ```yaml
-//! server:
-//!   address: 192.168.1.20  # where the client connects
-//!   port: 8099
-//!   listen: 0.0.0.0        # where `rmtbuild serve` binds, default 127.0.0.1
-//!   max_payload_mb: 256    # largest file the server accepts, default 256
 //! commands:
 //!   build:
 //!     run: zig build
@@ -29,6 +24,10 @@
 //!       port: 7777           # server listen port, forwarded to the client
 //!       agent: C:\Tools\jetbrains_debugger_agent.exe
 //! ```
+//!
+//! Which server to use is the user's own setting and lives in their config directory, see
+//! `user_config.zig`. A `server:` map here (same keys) is a default shared by everyone using
+//! the repo, used only when the user's config names no server.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -125,12 +124,50 @@ fn parse_port(text: []const u8) !u16 {
     return port;
 }
 
-pub const Config = struct {
+/// Where the client connects and how `rmtbuild serve` listens. It differs per person, so it
+/// normally comes from the user's own config (`user_config.zig`), not the repo.
+pub const Server = struct {
+    /// Where the client connects.
     address: []const u8 = "127.0.0.1",
     port: u16 = 8099,
+    /// Where `rmtbuild serve` binds.
     listen: []const u8 = "127.0.0.1",
     /// Largest file `rmtbuild serve` accepts.
     max_payload_mb: u32 = 256,
+
+    /// `path` names the map in error messages, e.g. `server`. Keys left out keep their defaults.
+    pub fn parse(arena: Allocator, node: Node, path: []const u8, diag: *Diagnostic) !Server {
+        const map = try expect_map(arena, node, path, diag);
+        var server: Server = .{};
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const value = try expect_scalar(arena, entry.value_ptr.*, path, key, diag);
+
+            if (std.mem.eql(u8, key, "address")) {
+                server.address = value;
+            } else if (std.mem.eql(u8, key, "listen")) {
+                server.listen = value;
+            } else if (std.mem.eql(u8, key, "max_payload_mb")) {
+                // Payload lengths are u32 on the wire.
+                server.max_payload_mb = std.fmt.parseInt(u32, value, 10) catch 0;
+                if (server.max_payload_mb == 0 or server.max_payload_mb > 4095)
+                    return fail_fmt(arena, diag, "{s}.max_payload_mb: '{s}' isn't a size in MB (1-4095)", .{ path, value });
+            } else if (std.mem.eql(u8, key, "port")) {
+                server.port = std.fmt.parseInt(u16, value, 10) catch
+                    return fail_fmt(arena, diag, "{s}.port: '{s}' isn't a port number (0-65535)", .{ path, value });
+            } else {
+                return fail_fmt(arena, diag, "{s}: unknown key '{s}', expected 'address', 'port', 'listen' or 'max_payload_mb'", .{ path, key });
+            }
+        }
+        return server;
+    }
+};
+
+pub const Config = struct {
+    /// A server shared by everyone using the repo. Only used when the user's own config names
+    /// none, see `user_config.zig`. Null when the file has no `server` keys.
+    server: ?Server = null,
     /// In file order.
     commands: std.StringArrayHashMapUnmanaged(Command) = .empty,
 
@@ -143,7 +180,7 @@ pub const Config = struct {
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             if (std.mem.eql(u8, key, "server")) {
-                try config.parse_server(arena, entry.value_ptr.*, diag);
+                if (!is_empty(entry.value_ptr.*)) config.server = try Server.parse(arena, entry.value_ptr.*, "server", diag);
             } else if (std.mem.eql(u8, key, "commands")) {
                 try config.parse_commands(arena, entry.value_ptr.*, diag);
             } else {
@@ -157,31 +194,6 @@ pub const Config = struct {
     pub fn load(arena: Allocator, io: std.Io, dir: std.Io.Dir, diag: *Diagnostic) !Config {
         const text = try dir.readFileAlloc(io, file_name, arena, .limited(1024 * 1024));
         return parse(arena, text, diag);
-    }
-
-    fn parse_server(self: *Config, arena: Allocator, node: Node, diag: *Diagnostic) !void {
-        const map = try expect_map(arena, node, "server", diag);
-        var it = map.iterator();
-        while (it.next()) |entry| {
-            const key = entry.key_ptr.*;
-            const value = try expect_scalar(arena, entry.value_ptr.*, "server", key, diag);
-
-            if (std.mem.eql(u8, key, "address")) {
-                self.address = value;
-            } else if (std.mem.eql(u8, key, "listen")) {
-                self.listen = value;
-            } else if (std.mem.eql(u8, key, "max_payload_mb")) {
-                // Payload lengths are u32 on the wire.
-                self.max_payload_mb = std.fmt.parseInt(u32, value, 10) catch 0;
-                if (self.max_payload_mb == 0 or self.max_payload_mb > 4095)
-                    return fail_fmt(arena, diag, "server.max_payload_mb: '{s}' isn't a size in MB (1-4095)", .{value});
-            } else if (std.mem.eql(u8, key, "port")) {
-                self.port = std.fmt.parseInt(u16, value, 10) catch
-                    return fail_fmt(arena, diag, "server.port: '{s}' isn't a port number (0-65535)", .{value});
-            } else {
-                return fail_fmt(arena, diag, "server: unknown key '{s}', expected 'address', 'port', 'listen' or 'max_payload_mb'", .{key});
-            }
-        }
     }
 
     fn parse_commands(self: *Config, arena: Allocator, node: Node, diag: *Diagnostic) !void {
@@ -233,21 +245,29 @@ pub const Config = struct {
             try self.commands.put(arena, name, .{ .run = script, .forward = forward, .debug = debug });
         }
     }
-
-    fn expect_map(arena: Allocator, node: Node, path: []const u8, diag: *Diagnostic) !Node.Map {
-        return switch (node) {
-            .map => |m| m,
-            .scalar => |s| if (s.len == 0) .empty else fail_fmt(arena, diag, "{s}: expected nested keys, got '{s}'", .{ path, s }),
-        };
-    }
-
-    fn expect_scalar(arena: Allocator, node: Node, path: []const u8, key: []const u8, diag: *Diagnostic) ![]const u8 {
-        return switch (node) {
-            .scalar => |s| s,
-            .map => fail_fmt(arena, diag, "{s}.{s}: expected a value, got nested keys", .{ path, key }),
-        };
-    }
 };
+
+/// A key with nothing under it, e.g. a `server:` whose keys are all commented out.
+pub fn is_empty(node: Node) bool {
+    return switch (node) {
+        .scalar => |s| s.len == 0,
+        .map => |m| m.count() == 0,
+    };
+}
+
+pub fn expect_map(arena: Allocator, node: Node, path: []const u8, diag: *Diagnostic) !Node.Map {
+    return switch (node) {
+        .map => |m| m,
+        .scalar => |s| if (s.len == 0) .empty else fail_fmt(arena, diag, "{s}: expected nested keys, got '{s}'", .{ path, s }),
+    };
+}
+
+pub fn expect_scalar(arena: Allocator, node: Node, path: []const u8, key: []const u8, diag: *Diagnostic) ![]const u8 {
+    return switch (node) {
+        .scalar => |s| s,
+        .map => fail_fmt(arena, diag, "{s}.{s}: expected a value, got nested keys", .{ path, key }),
+    };
+}
 
 fn parse_debug(arena: Allocator, path: []const u8, node: Node, diag: *Diagnostic) !Debug {
     const debug_path = try std.fmt.allocPrint(arena, "{s}.debug", .{path});
@@ -257,7 +277,7 @@ fn parse_debug(arena: Allocator, path: []const u8, node: Node, diag: *Diagnostic
         return finish_debug(arena, debug_path, mode, null, null, null, true, false, null, &.{}, diag);
     }
 
-    const fields = try Config.expect_map(arena, node, debug_path, diag);
+    const fields = try expect_map(arena, node, debug_path, diag);
     var mode: ?DebugMode = null;
     var port: ?u16 = null;
     var local: ?u16 = null;
@@ -270,7 +290,7 @@ fn parse_debug(arena: Allocator, path: []const u8, node: Node, diag: *Diagnostic
     var it = fields.iterator();
     while (it.next()) |field| {
         const key = field.key_ptr.*;
-        const value = try Config.expect_scalar(arena, field.value_ptr.*, debug_path, key, diag);
+        const value = try expect_scalar(arena, field.value_ptr.*, debug_path, key, diag);
         if (std.mem.eql(u8, key, "mode")) {
             mode = try parse_debug_mode(arena, debug_path, value, diag);
         } else if (std.mem.eql(u8, key, "port") or std.mem.eql(u8, key, "local")) {
@@ -382,7 +402,7 @@ pub fn split_args(arena: Allocator, text: []const u8) error{ UnterminatedQuote, 
     return list.items;
 }
 
-fn fail_fmt(arena: Allocator, diag: *Diagnostic, comptime fmt: []const u8, args: anytype) error{ InvalidConfig, OutOfMemory } {
+pub fn fail_fmt(arena: Allocator, diag: *Diagnostic, comptime fmt: []const u8, args: anytype) error{ InvalidConfig, OutOfMemory } {
     diag.* = .{ .message = try std.fmt.allocPrint(arena, fmt, args) };
     return error.InvalidConfig;
 }
@@ -666,10 +686,11 @@ test "Config full example" {
         \\
     );
 
-    try std.testing.expectEqualStrings("192.168.1.20", config.address);
-    try std.testing.expectEqual(9000, config.port);
-    try std.testing.expectEqualStrings("0.0.0.0", config.listen);
-    try std.testing.expectEqual(64, config.max_payload_mb);
+    const server = config.server.?;
+    try std.testing.expectEqualStrings("192.168.1.20", server.address);
+    try std.testing.expectEqual(9000, server.port);
+    try std.testing.expectEqualStrings("0.0.0.0", server.listen);
+    try std.testing.expectEqual(64, server.max_payload_mb);
 
     try std.testing.expectEqualStrings("build", config.commands.keys()[0]);
     try std.testing.expectEqualStrings("zig build -Doptimize=ReleaseFast", config.commands.get("build").?.run);
@@ -754,10 +775,19 @@ test "Config defaults" {
         \\      ls zig-out
     );
 
-    try std.testing.expectEqualStrings("127.0.0.1", config.address);
-    try std.testing.expectEqual(8099, config.port);
-    try std.testing.expectEqualStrings("127.0.0.1", config.listen);
+    try std.testing.expect(config.server == null);
     try std.testing.expectEqualStrings("zig build\nls zig-out", config.commands.get("build").?.run);
+
+    // Keys left out of `server` keep their defaults.
+    const partial = try test_parse(arena.allocator(), "server:\n  address: 10.0.0.5\n");
+    try std.testing.expectEqualStrings("10.0.0.5", partial.server.?.address);
+    try std.testing.expectEqual(8099, partial.server.?.port);
+    try std.testing.expectEqualStrings("127.0.0.1", partial.server.?.listen);
+    try std.testing.expectEqual(256, partial.server.?.max_payload_mb);
+
+    // A `server:` with everything commented out is no server at all.
+    const commented = try test_parse(arena.allocator(), "server:\n  # address: 10.0.0.5\ncommands:\n");
+    try std.testing.expect(commented.server == null);
 
     const empty = try test_parse(arena.allocator(), "# nothing yet\n");
     try std.testing.expect(empty.commands.count() == 0);
