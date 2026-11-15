@@ -18,26 +18,31 @@ The binary is `zig-out/bin/rmtbuild`. `zig build -Dtarget=x86_64-windows` cross-
 ## Commands
 
 ```text
-rmtbuild keygen [--force]                  create the shared key
+rmtbuild keygen [--force] [--address IP] [--port N]
+                                           create the shared key and your server config
 rmtbuild serve [--listen ADDR] [--port N]  serve the git repo in the current directory
 rmtbuild <command>                         sync, then run <command> from rmtbuild.yaml
-rmtbuild help
+rmtbuild help                              also shows which server this directory uses
 ```
 
-`keygen` writes `$XDG_CONFIG_HOME/rmtbuild/key`, or `~/.config/rmtbuild/key`, or `%APPDATA%\rmtbuild\key`. Copy that file to the same path on the other machine (`chmod 600` on Unix). `RMTBUILD_KEY` (64 hex characters) overrides the file.
+`keygen` writes two files to `$XDG_CONFIG_HOME/rmtbuild/`, or `~/.config/rmtbuild/`, or `%APPDATA%\rmtbuild\`:
+
+- `key`, the shared key. Copy it to the same path on the other machine (`chmod 600` on Unix). `RMTBUILD_KEY` (64 hex characters) overrides the file.
+- `config.yaml`, your [server config](#your-server), with the build machine's `--address` and `--port` in it (`127.0.0.1` and `8099` if you leave them out).
+
+An existing `config.yaml` is never replaced, not even with `--force`. If you already have a key, `rmtbuild keygen` keeps it and only writes the missing `config.yaml`.
 
 `serve` must be started in a git checkout. It only syncs tracked files, so new files need `git add` before they are sent. Untracked build output stays on the server.
 
 ## Config
 
+The commands are the same for everyone, so they live in the repo. Which server they run on differs per person, so that lives in your own config directory.
+
+### Commands
+
 `rmtbuild.yaml` in the repo root (it has to be tracked, the server reads its own synced copy):
 
 ```yaml
-server:
-  address: 192.168.1.20   # client connects here
-  port: 8099
-  listen: 0.0.0.0         # serve bind address, default 127.0.0.1
-  max_payload_mb: 256
 commands:
   build:
     run: zig build
@@ -49,6 +54,42 @@ commands:
 `run` is a script: `sh -c` on a POSIX server, a `.cmd` batch file on Windows (`%%i` in `for` loops, `exit /b N`). `forward` publishes server localhost ports on the client's localhost while the command runs.
 
 Command names `serve`, `keygen`, and `help` are reserved.
+
+### Your server
+
+`config.yaml` next to the key, written by `rmtbuild keygen` and edited by hand after that:
+
+```yaml
+# The server for every directory that has no entry under 'directories'.
+server:
+  address: 192.168.1.20   # the build machine, where `rmtbuild <command>` connects
+  port: 8099
+  listen: 0.0.0.0         # where `rmtbuild serve` binds, default 127.0.0.1
+  max_payload_mb: 256     # largest file `rmtbuild serve` accepts
+
+# A server for one directory and everything below it.
+directories:
+  ~/work/app:
+    address: 10.0.0.5
+    port: 9000
+  C:\Users\me\work\legacy:   # on Windows
+    address: 10.0.0.6
+```
+
+The same file works on both machines: the client reads `address` and `port`, `rmtbuild serve` reads `listen`, `port`, and `max_payload_mb` (`--listen` and `--port` override it).
+
+A `directories` key is a full path, or one starting with `~`. It covers that directory and everything below it; if several match, the longest path wins. Symlinks are followed on both sides of the comparison. Put a path that contains `: ` or `#` in single quotes.
+
+The server is picked in this order:
+
+1. the `directories` entry the current directory is in
+2. `server` in your `config.yaml`
+3. `server` in the repo's `rmtbuild.yaml` (same keys), a default shared by everyone using the repo
+4. `127.0.0.1:8099`
+
+The one picked is used whole. Keys it leaves out take the built-in defaults, not the values from the next one down, so a `directories` entry with only `address` uses port `8099` even if your fallback `server` says otherwise.
+
+`rmtbuild help` prints the server the current directory resolves to and where that came from.
 
 ## Debugging .NET Framework
 

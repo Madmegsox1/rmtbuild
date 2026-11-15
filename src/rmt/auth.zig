@@ -108,17 +108,23 @@ const has_mode = @hasDecl(std.Io.File.Permissions, "toMode");
 /// `$XDG_CONFIG_HOME/rmtbuild/key`, otherwise `%APPDATA%\rmtbuild\key` on Windows and
 /// `~/.config/rmtbuild/key` elsewhere. Caller frees.
 pub fn default_key_path(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
-    return default_key_path_for(builtin.os.tag, allocator, environ);
+    return config_file_path(allocator, environ, "key");
 }
 
-fn default_key_path_for(os: std.Target.Os.Tag, allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
-    if (nonempty(environ.get("XDG_CONFIG_HOME"))) |dir| return join(os, allocator, &.{ dir, "rmtbuild", "key" });
+/// `name` in the directory the key lives in, where rmtbuild keeps everything that belongs to
+/// the user rather than to a repo. Caller frees.
+pub fn config_file_path(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, name: []const u8) ![]u8 {
+    return config_file_path_for(builtin.os.tag, allocator, environ, name);
+}
+
+fn config_file_path_for(os: std.Target.Os.Tag, allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, name: []const u8) ![]u8 {
+    if (nonempty(environ.get("XDG_CONFIG_HOME"))) |dir| return join(os, allocator, &.{ dir, "rmtbuild", name });
     if (os == .windows) {
         const appdata = nonempty(environ.get("APPDATA")) orelse return error.NoHomeDir;
-        return join(os, allocator, &.{ appdata, "rmtbuild", "key" });
+        return join(os, allocator, &.{ appdata, "rmtbuild", name });
     }
     const home = nonempty(environ.get("HOME")) orelse return error.NoHomeDir;
-    return join(os, allocator, &.{ home, ".config", "rmtbuild", "key" });
+    return join(os, allocator, &.{ home, ".config", "rmtbuild", name });
 }
 
 fn nonempty(value: ?[]const u8) ?[]const u8 {
@@ -280,27 +286,32 @@ test "Key file" {
     }
 }
 
-test "Default key path" {
+test "Config file paths" {
     var environ: std.process.Environ.Map = .init(std.testing.allocator);
     defer environ.deinit();
 
     const a = std.testing.allocator;
-    try std.testing.expectError(error.NoHomeDir, default_key_path_for(.linux, a, &environ));
-    try std.testing.expectError(error.NoHomeDir, default_key_path_for(.windows, a, &environ));
+    try std.testing.expectError(error.NoHomeDir, config_file_path_for(.linux, a, &environ, "key"));
+    try std.testing.expectError(error.NoHomeDir, config_file_path_for(.windows, a, &environ, "key"));
 
     try environ.put("HOME", "/home/me");
     try environ.put("APPDATA", "C:\\Users\\me\\AppData\\Roaming");
 
-    const home_path = try default_key_path_for(.linux, a, &environ);
+    const home_path = try config_file_path_for(.linux, a, &environ, "key");
     defer a.free(home_path);
     try std.testing.expectEqualStrings("/home/me/.config/rmtbuild/key", home_path);
 
-    const appdata_path = try default_key_path_for(.windows, a, &environ);
+    const appdata_path = try config_file_path_for(.windows, a, &environ, "key");
     defer a.free(appdata_path);
     try std.testing.expectEqualStrings("C:\\Users\\me\\AppData\\Roaming\\rmtbuild\\key", appdata_path);
 
+    // The user's config sits next to the key.
+    const config_path = try config_file_path_for(.linux, a, &environ, "config.yaml");
+    defer a.free(config_path);
+    try std.testing.expectEqualStrings("/home/me/.config/rmtbuild/config.yaml", config_path);
+
     try environ.put("XDG_CONFIG_HOME", "/cfg");
-    const xdg_path = try default_key_path_for(.linux, a, &environ);
+    const xdg_path = try config_file_path_for(.linux, a, &environ, "key");
     defer a.free(xdg_path);
     try std.testing.expectEqualStrings("/cfg/rmtbuild/key", xdg_path);
 }
