@@ -80,10 +80,12 @@ pub const FileHandler = struct {
 
     /// Sources the git tracked files. Only tracked files are synced, untracked ones
     /// (build output, caches, scratch files) never are, so new files need a `git add`.
-    /// Tracked files deleted from disk without `git rm` are skipped.
+    /// Tracked files deleted from disk without `git rm` are skipped, and so are submodules:
+    /// git tracks one of those as a single entry, but on disk it's a directory.
     pub fn source_git_files(self: *Self) !void {
         // -z: NUL separated and unquoted, otherwise git escapes unusual paths.
-        const stdout = try self.git(&.{ "git", "ls-files", "-z" });
+        // -s: each entry is "<mode> <object> <stage>\t<path>", the mode tells submodules apart.
+        const stdout = try self.git(&.{ "git", "ls-files", "-z", "-s" });
 
         self.allocator.free(self.buffer);
         self.buffer = stdout;
@@ -91,8 +93,16 @@ pub const FileHandler = struct {
         self.hashed_files.clearRetainingCapacity();
         self.free_owned_names();
 
-        var paths = std.mem.tokenizeScalar(u8, self.buffer, 0);
-        while (paths.next()) |path| {
+        var entries = std.mem.tokenizeScalar(u8, self.buffer, 0);
+        var previous: []const u8 = "";
+        while (entries.next()) |entry| {
+            const tab = std.mem.indexOfScalar(u8, entry, '\t') orelse return error.UnexpectedGitOutput;
+            if (std.mem.startsWith(u8, entry, "160000 ")) continue;
+            const path = entry[tab + 1 ..];
+            // A path with a merge conflict is listed once per stage.
+            if (std.mem.eql(u8, path, previous)) continue;
+            previous = path;
+
             self.root.access(self.io, path, .{}) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
@@ -303,6 +313,26 @@ test "Replace File" {
     try std.testing.expectError(error.StaleHash, handler.replace_file("a.txt", sha("old"), "x"));
     try std.testing.expectError(error.FileNotTracked, handler.replace_file("nope.txt", 0, "x"));
     try std.testing.expectError(error.InvalidPath, handler.replace_file("../a.txt", 0, "x"));
+}
+
+test "Submodules are skipped" {
+    const io = std.testing.io;
+    var repo = try TestRepo.init(io, ".zig-cache/submodule_test");
+    defer repo.deinit();
+
+    var handler: FileHandler = .init_in(std.testing.allocator, io, repo.dir);
+    defer handler.deinit();
+
+    try repo.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "a" });
+    try repo.dir.createDirPath(io, "sub");
+    std.testing.allocator.free(try handler.git(&.{ "git", "add", "a.txt" }));
+    // A gitlink, which is what a submodule is in the index, without cloning one.
+    std.testing.allocator.free(try handler.git(&.{ "git", "update-index", "--add", "--cacheinfo", "160000,84bf53e4a3d0bfe3f60db15edf3861d2abd446b6,sub" }));
+
+    try handler.source_git_files();
+    try handler.hash_files();
+    try std.testing.expectEqual(@as(usize, 1), handler.get().len);
+    try std.testing.expectEqualStrings("a.txt", handler.get()[0]);
 }
 
 test "Create File" {

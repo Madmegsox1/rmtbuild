@@ -11,7 +11,10 @@ pub fn build(b: *std.Build) void {
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
+    // The binary gets copied to other machines (the build server), so default to a baseline
+    // CPU rather than this one's: a native build crashes with "Illegal instruction" on an
+    // older CPU. `-Dcpu=native` still builds for this machine.
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
